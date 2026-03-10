@@ -759,7 +759,7 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
     p_imu.reset(new ImuProcess());
     bool gravity_align_en = true;
-    p_imu->set_gravity_align_enable(gravity_align_en);
+    
     
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -796,7 +796,7 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
 
-    
+    p_imu->set_gravity_align_enable(gravity_align_en);
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
