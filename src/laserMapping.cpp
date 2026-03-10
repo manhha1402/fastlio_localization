@@ -138,7 +138,7 @@ geometry_msgs::Quaternion geoQuat;
 geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
-shared_ptr<ImuProcess> p_imu(new ImuProcess());
+shared_ptr<ImuProcess> p_imu;
 
 void SigHandle(int sig)
 {
@@ -757,7 +757,10 @@ int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh;
-
+    p_imu.reset(new ImuProcess());
+    bool gravity_align_en = true;
+    
+    
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
@@ -772,6 +775,7 @@ int main(int argc, char** argv)
     nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
     nh.param<double>("cube_side_length",cube_len,200);
+    nh.param<bool>("mapping/gravity_align_en", gravity_align_en, true);
     nh.param<float>("mapping/det_range",DET_RANGE,300.f);
     nh.param<double>("mapping/fov_degree",fov_deg,180);
     nh.param<double>("mapping/gyr_cov",gyr_cov,0.1);
@@ -792,6 +796,7 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
 
+    p_imu->set_gravity_align_enable(gravity_align_en);
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
