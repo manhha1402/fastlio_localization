@@ -1608,7 +1608,7 @@ int main(int argc, char** argv)
             /* 中文注释：
             保存更新前状态，用于更新后验门控 */
             state_ikfom state_before_update = kf.get_x();
-
+            auto P_before_update = kf.get_P();
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 
             state_ikfom state_after_update = kf.get_x();
@@ -1620,6 +1620,7 @@ int main(int argc, char** argv)
                 !check_pose_update_reasonable(state_before_update, state_after_update))
             {
                 kf.change_x(state_before_update);
+                kf.change_P(P_before_update);
                 state_point = state_before_update;
                 accept_lidar_update = false;
             }
