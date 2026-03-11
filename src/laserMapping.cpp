@@ -127,10 +127,8 @@ enum LocalizationTrackingState
 /* 当前定位跟踪状态 */
 int tracking_state = TRACKING_UNLOCKED;
 
-/* 连续良好匹配计数 */
+int acceptable_match_streak = 0;
 int good_match_streak = 0;
-
-/* 连续差匹配计数 */
 int bad_match_streak = 0;
 
 double min_time_before_lock_sec = 2.0;
@@ -610,12 +608,21 @@ void update_tracking_state_machine()
 
     if (match_acceptable)
     {
-        good_match_streak++;
+        acceptable_match_streak++;
         bad_match_streak = 0;
     }
     else
     {
+        acceptable_match_streak = 0;
         bad_match_streak++;
+    }
+
+    if (match_good)
+    {
+        good_match_streak++;
+    }
+    else
+    {
         good_match_streak = 0;
     }
 
@@ -623,7 +630,7 @@ void update_tracking_state_machine()
 
     if (tracking_state == TRACKING_UNLOCKED)
     {
-        if (match_acceptable && good_match_streak >= 3)
+        if (match_acceptable && acceptable_match_streak >= 3)
         {
             tracking_state = TRACKING_TRACKING;
             save_last_tracking_state();
@@ -1074,6 +1081,7 @@ void publish_localization_status_overlay(const ros::Publisher & pubOverlay)
     oss << "Mean residual: " << std::fixed << std::setprecision(3) << res_mean_last << "\n";
     oss << "Good streak: " << good_match_streak << "\n";
     oss << "Bad streak: " << bad_match_streak << "\n";
+    oss << "Acceptable streak: " << acceptable_match_streak << "\n";
     oss << "Update accepted: " << (accept_lidar_update ? "YES" : "NO")<< "\n";
     oss << "Has last tracking: " << (has_last_tracking_state ? "YES" : "NO") << "\n";
     oss << "Has last locked: " << (has_last_locked_state ? "YES" : "NO") << "\n";
@@ -1375,6 +1383,7 @@ int main(int argc, char** argv)
         ROS_INFO("[FAST_LIO_Relocation] Running in LOCALIZATION mode.");
 
         tracking_state = TRACKING_UNLOCKED;
+        acceptable_match_streak = 0;
         good_match_streak = 0;
         bad_match_streak = 0;
         accept_lidar_update = true;
