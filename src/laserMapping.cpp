@@ -1149,7 +1149,7 @@ int main(int argc, char** argv)
             /* ================= FAST_LIO_Relocation modification ================= */
             /* 在定位模式下不允许删除地图点 */
 
-            if (is_localization_mode())
+            if (is_mapping_mode())
             {
                 lasermap_fov_segment();
             }
