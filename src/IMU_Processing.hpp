@@ -264,13 +264,6 @@ void ImuProcess::IMU_init(const MeasureGroup &meas,
               (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr) * (N - 1.0) / (N * N);
 
     N++;
-    ROS_INFO_STREAM("gravity_align_en_=" << gravity_align_en_
-                << ", has_align_=" << has_align_
-                << ", q_align_wxyz="
-                << q_align_.w() << ", "
-                << q_align_.x() << ", "
-                << q_align_.y() << ", "
-                << q_align_.z());
   }
 
   state_ikfom init_state = kf_state.get_x();
