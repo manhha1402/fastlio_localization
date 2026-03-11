@@ -54,6 +54,7 @@ find_package(catkin REQUIRED COMPONENTS
   livox_ros_driver
   message_generation
   eigen_conversions
+  jsk_rviz_plugins
 )
 
 find_package(Eigen3 REQUIRED)
@@ -79,7 +80,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
+  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime jsk_rviz_plugins
   DEPENDS EIGEN3 PCL
   INCLUDE_DIRS
 )
