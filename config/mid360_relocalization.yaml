@@ -26,6 +26,19 @@ mapping:
     extrinsic_R: [ 1, 0, 0,
                    0, 1, 0,
                    0, 0, 1 ]
+localization:
+    min_effective_points_for_tracking: 15
+    max_residual_for_tracking: 0.1
+
+    min_effective_points_for_good: 180
+    max_residual_for_good: 0.08
+
+    good_match_streak_to_lock: 20
+    bad_match_streak_to_lost: 5
+    min_time_before_lock_sec: 1.0
+
+    max_position_jump_for_update_locked: 0.5
+    prior_map_pub_interval: 50
 
 publish:
     path_en: false

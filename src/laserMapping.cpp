@@ -60,6 +60,10 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
+#include <jsk_rviz_plugins/OverlayText.h>
+#include <sstream>
+#include <iomanip>
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
@@ -110,10 +114,61 @@ PointCloudXYZI::Ptr prior_map_ds(new PointCloudXYZI());
 /* PCD 地图体素降采样大小 */
 double map_voxel_size = 0.5;
 
+/* ================= FAST_LIO_Relocation robustness modification ================= */
+/* 定位跟踪状态定义 */
+enum LocalizationTrackingState
+{
+    TRACKING_UNLOCKED = 0,
+    TRACKING_TRACKING = 1,
+    TRACKING_LOCKED   = 2,
+    TRACKING_LOST     = 3
+};
+
+/* 当前定位跟踪状态 */
+int tracking_state = TRACKING_UNLOCKED;
+
+int acceptable_match_streak = 0;
+int good_match_streak = 0;
+int bad_match_streak = 0;
+
+double min_time_before_lock_sec = 2.0;
+
+bool has_last_locked_state = false;
+state_ikfom last_locked_state;
+
+bool has_last_tracking_state = false;
+state_ikfom last_tracking_state;
+
+
+/* 当前帧激光更新是否被接受 */
+bool accept_lidar_update = true;
+
+/* 当前帧匹配质量 */
+bool current_match_good = false;
+
+/* 匹配质量门限 */
+int min_effective_points_for_good = 30;
+double max_residual_for_good = 0.20;
+int min_effective_points_for_tracking = 15;
+double max_residual_for_tracking = 0.40;
+/* 连续计数门限 */
+int good_match_streak_to_lock = 5;
+int bad_match_streak_to_lost = 5;
+
+/* 更新后验门控阈值 */
+/* 更新后验位置门控阈值（仅在 LOCKED 状态下启用） */
+double max_position_jump_for_update_locked = 1.0;   // meter
+
 /* 先验地图发布控制 */
 bool prior_map_published_once = false;
 int prior_map_pub_counter = 0;
 int prior_map_pub_interval = 50;
+
+/* RViz 屏幕固定文字状态发布 */
+ros::Publisher pubLocalizationOverlayText;
+/* ================= FAST_LIO_Relocation robustness modification ================= */
+
+
 /* ================= FAST_LIO_Relocation modification ================= */
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -454,6 +509,14 @@ bool sync_packages(MeasureGroup &meas)
     return true;
 }
 
+inline bool allow_map_update()
+{
+    /* 中文注释：
+       在重定位模式下地图是固定的，不允许新增或删除点
+       只有 mapping 模式允许更新地图 */
+    return run_mode == MODE_MAPPING;
+}
+
 inline bool is_mapping_mode()
 {
     return run_mode == MODE_MAPPING;
@@ -464,12 +527,202 @@ inline bool is_localization_mode()
     return run_mode == MODE_LOCALIZATION;
 }
 
-inline bool allow_map_update()
+std::string get_tracking_state_name()
+{
+    if (tracking_state == TRACKING_UNLOCKED) return "UNLOCKED";
+    if (tracking_state == TRACKING_TRACKING) return "TRACKING";
+    if (tracking_state == TRACKING_LOCKED)   return "LOCKED";
+    if (tracking_state == TRACKING_LOST)     return "LOST";
+    return "UNKNOWN";
+}
+
+void save_last_tracking_state()
+{
+    last_tracking_state = state_point;
+    has_last_tracking_state = true;
+}
+
+void save_last_locked_state()
+{
+    last_locked_state = state_point;
+    has_last_locked_state = true;
+}
+
+bool is_match_acceptable()
 {
     /* 中文注释：
-       在重定位模式下地图是固定的，不允许新增或删除点
-       只有 mapping 模式允许更新地图 */
-    return run_mode == MODE_MAPPING;
+       acceptable 表示还能维持 TRACKING，
+       但不一定足够好到进入 LOCKED */
+
+    if (!accept_lidar_update)
+    {
+        return false;
+    }
+
+    if (effct_feat_num < min_effective_points_for_tracking)
+    {
+        return false;
+    }
+
+    if (res_mean_last > max_residual_for_tracking)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool is_match_good()
+{
+    /* 中文注释：
+       good 表示质量较高，可用于进入或维持 LOCKED */
+
+    if (!accept_lidar_update)
+    {
+        return false;
+    }
+
+    if (effct_feat_num < min_effective_points_for_good)
+    {
+        return false;
+    }
+
+    if (res_mean_last > max_residual_for_good)
+    {
+        return false;
+    }
+
+    return true;
+}
+void update_tracking_state_machine()
+{
+    /* 中文注释：
+       四态状态机：
+       UNLOCKED -> TRACKING -> LOCKED -> TRACKING -> LOST
+       LOST 状态下不自动恢复，等待外部重定位模块 */
+
+    bool match_acceptable = is_match_acceptable();
+    bool match_good = is_match_good();
+
+    current_match_good = match_good;
+
+    if (match_acceptable)
+    {
+        acceptable_match_streak++;
+        bad_match_streak = 0;
+    }
+    else
+    {
+        acceptable_match_streak = 0;
+        bad_match_streak++;
+    }
+
+    if (match_good)
+    {
+        good_match_streak++;
+    }
+    else
+    {
+        good_match_streak = 0;
+    }
+
+    double time_since_start = Measures.lidar_beg_time - first_lidar_time;
+
+    if (tracking_state == TRACKING_UNLOCKED)
+    {
+        if (match_acceptable && acceptable_match_streak >= 3)
+        {
+            tracking_state = TRACKING_TRACKING;
+            save_last_tracking_state();
+            ROS_INFO("[FAST_LIO_Relocation] Tracking state switched to TRACKING.");
+        }
+        return;
+    }
+
+    if (tracking_state == TRACKING_TRACKING)
+    {
+        if (match_acceptable)
+        {
+            save_last_tracking_state();
+        }
+
+        if (time_since_start >= min_time_before_lock_sec &&
+            match_good &&
+            good_match_streak >= good_match_streak_to_lock)
+        {
+            tracking_state = TRACKING_LOCKED;
+            save_last_tracking_state();
+            save_last_locked_state();
+            ROS_INFO("[FAST_LIO_Relocation] Tracking state switched to LOCKED.");
+            return;
+        }
+
+        if (!match_acceptable &&
+            bad_match_streak >= bad_match_streak_to_lost)
+        {
+            tracking_state = TRACKING_LOST;
+            ROS_WARN("[FAST_LIO_Relocation] Tracking state switched to LOST.");
+            return;
+        }
+
+        return;
+    }
+    if (tracking_state == TRACKING_LOCKED)
+    {
+        if (match_acceptable)
+        {
+            save_last_tracking_state();
+        }
+
+        if (match_good)
+        {
+            save_last_locked_state();
+        }
+
+        if (!match_good)
+        {
+            tracking_state = TRACKING_TRACKING;
+            good_match_streak = 0;
+            ROS_WARN("[FAST_LIO_Relocation] Tracking state downgraded to TRACKING.");
+            return;
+        }
+
+        return;
+    }
+
+    if (tracking_state == TRACKING_LOST)
+    {
+        /* 中文注释：
+           LOST 状态下保持冻结，等待外部重定位，不自动回到其他状态 */
+        return;
+    }
+}
+
+
+
+bool check_pose_update_reasonable(const state_ikfom &state_before,
+                                  const state_ikfom &state_after)
+{
+    /* 中文注释：
+       仅在 LOCKED 状态下做位置门控。
+       UNLOCKED / TRACKING / LOST 阶段允许较大修正，以便收敛。 */
+
+    if (tracking_state != TRACKING_LOCKED)
+    {
+        return true;
+    }
+
+    double delta_pos = (state_after.pos - state_before.pos).norm();
+
+    if (delta_pos > max_position_jump_for_update_locked)
+    {
+        ROS_WARN_STREAM("[FAST_LIO_Relocation] Reject update: delta_pos too large = "
+                        << delta_pos << ", threshold = "
+                        << max_position_jump_for_update_locked);
+        return false;
+    }
+
+    return true;
 }
 
 bool load_prior_map_from_pcd(const std::string &pcd_path,
@@ -742,10 +995,6 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
 
 void publish_prior_map(const ros::Publisher & pubLaserCloudMap)
 {
-    /* 中文注释：
-       发布加载的先验地图
-       用于在 RViz 中查看固定地图 */
-
     if (!prior_map_loaded || prior_map_ds->empty())
     {
         return;
@@ -753,9 +1002,104 @@ void publish_prior_map(const ros::Publisher & pubLaserCloudMap)
 
     sensor_msgs::PointCloud2 laserCloudMap;
     pcl::toROSMsg(*prior_map_ds, laserCloudMap);
-    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
+
+    laserCloudMap.header.stamp = (lidar_end_time > 0.0) ?
+                                 ros::Time().fromSec(lidar_end_time) :
+                                 ros::Time::now();
+
     laserCloudMap.header.frame_id = "map";
     pubLaserCloudMap.publish(laserCloudMap);
+}
+
+void publish_localization_status_overlay(const ros::Publisher & pubOverlay)
+{
+    /* 中文注释：
+       使用 OverlayText 在 RViz 屏幕固定位置显示定位状态 */
+
+    if (!is_localization_mode())
+    {
+        return;
+    }
+
+    jsk_rviz_plugins::OverlayText text;
+    text.action = jsk_rviz_plugins::OverlayText::ADD;
+
+    text.width = 420;
+    text.height = 240;
+
+    /* 中文注释：
+       这里控制文字框在 RViz 屏幕中的位置
+       left/top 越小越靠左上角 */
+    text.left = 20;
+    text.top = 20;
+
+    text.text_size = 16;
+    text.line_width = 2;
+    text.font = "DejaVu Sans Mono";
+
+    /* 背景颜色 */
+    text.bg_color.r = 0.0;
+    text.bg_color.g = 0.0;
+    text.bg_color.b = 0.0;
+    text.bg_color.a = 0.6;
+
+    /* 前景颜色按状态变化 */
+    if (tracking_state == TRACKING_LOCKED)
+    {
+        text.fg_color.r = 0.0;
+        text.fg_color.g = 1.0;
+        text.fg_color.b = 0.0;
+        text.fg_color.a = 1.0;
+    }
+    else if (tracking_state == TRACKING_TRACKING)
+    {
+        text.fg_color.r = 0.0;
+        text.fg_color.g = 0.8;
+        text.fg_color.b = 1.0;
+        text.fg_color.a = 1.0;
+    }
+    else if (tracking_state == TRACKING_UNLOCKED)
+    {
+        text.fg_color.r = 1.0;
+        text.fg_color.g = 1.0;
+        text.fg_color.b = 0.0;
+        text.fg_color.a = 1.0;
+    }
+    else
+    {
+        text.fg_color.r = 1.0;
+        text.fg_color.g = 0.0;
+        text.fg_color.b = 0.0;
+        text.fg_color.a = 1.0;
+    }
+
+    std::ostringstream oss;
+    oss << "FAST_LIO_Relocation\n";
+    oss << "Mode: LOCALIZATION\n";
+    oss << "State: " << get_tracking_state_name() << "\n";
+    oss << "Effective points: " << effct_feat_num << "\n";
+    oss << "Mean residual: " << std::fixed << std::setprecision(3) << res_mean_last << "\n";
+    oss << "Good streak: " << good_match_streak << "\n";
+    oss << "Bad streak: " << bad_match_streak << "\n";
+    oss << "Acceptable streak: " << acceptable_match_streak << "\n";
+    oss << "Update accepted: " << (accept_lidar_update ? "YES" : "NO")<< "\n";
+    oss << "Has last tracking: " << (has_last_tracking_state ? "YES" : "NO") << "\n";
+    oss << "Has last locked: " << (has_last_locked_state ? "YES" : "NO") << "\n";
+
+    text.text = oss.str();
+
+    pubOverlay.publish(text);
+}
+
+void refresh_pose_cache_from_state()
+{
+    euler_cur = SO3ToEuler(state_point.rot);
+    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+    geoQuat.x = state_point.rot.coeffs()[0];
+    geoQuat.y = state_point.rot.coeffs()[1];
+    geoQuat.z = state_point.rot.coeffs()[2];
+    geoQuat.w = state_point.rot.coeffs()[3];
 }
 
 template<typename T>
@@ -913,7 +1257,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        ROS_WARN("No Effective Points! \n");
+        ROS_WARN_THROTTLE(1.0, "[FAST_LIO_Relocation] No Effective Points!");
         return;
     }
 
@@ -1000,6 +1344,7 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+
     /* ================= FAST_LIO_Relocation modification ================= */
     /* 读取运行模式参数 */
     nh.param<int>("run_mode", run_mode, 0);
@@ -1007,6 +1352,22 @@ int main(int argc, char** argv)
     /* 读取地图体素大小 */
     nh.param<double>("map_voxel_size", map_voxel_size, 0.5);
     /* ================= FAST_LIO_Relocation modification ================= */
+
+    /* ================= FAST_LIO_Relocation robustness modification ================= */
+    nh.param<int>("localization/min_effective_points_for_tracking",
+              min_effective_points_for_tracking, 15);
+    nh.param<double>("localization/max_residual_for_tracking",
+                    max_residual_for_tracking, 0.40);
+    nh.param<double>("localization/min_time_before_lock_sec",
+                 min_time_before_lock_sec, 2.0);
+    nh.param<int>("localization/min_effective_points_for_good", min_effective_points_for_good, 30);
+    nh.param<double>("localization/max_residual_for_good", max_residual_for_good, 0.20);
+    nh.param<int>("localization/good_match_streak_to_lock", good_match_streak_to_lock, 5);
+    nh.param<int>("localization/bad_match_streak_to_lost", bad_match_streak_to_lost, 5);
+    nh.param<double>("localization/max_position_jump_for_update_locked",
+                 max_position_jump_for_update_locked, 1.0);
+    nh.param<int>("localization/prior_map_pub_interval", prior_map_pub_interval, 50);
+    /* ================= FAST_LIO_Relocation robustness modification ================= */
 
     /* ================= FAST_LIO_Relocation modification ================= */
     /* 判断当前运行模式 */
@@ -1020,6 +1381,14 @@ int main(int argc, char** argv)
     if (is_localization_mode())
     {
         ROS_INFO("[FAST_LIO_Relocation] Running in LOCALIZATION mode.");
+
+        tracking_state = TRACKING_UNLOCKED;
+        acceptable_match_streak = 0;
+        good_match_streak = 0;
+        bad_match_streak = 0;
+        accept_lidar_update = true;
+        prior_map_published_once = false;
+        prior_map_pub_counter = 0;
     }
     else
     {
@@ -1089,11 +1458,13 @@ int main(int argc, char** argv)
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_effected", 100000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("/Laser_map", 100000);
+        ("/Laser_map", 1, true);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    pubLocalizationOverlayText = nh.advertise<jsk_rviz_plugins::OverlayText>
+        ("/localization_status_overlay", 10);
     /* ================= FAST_LIO_Relocation modification ================= */
     /* 如果是定位模式，在进入主循环前加载先验地图 */
 
@@ -1104,6 +1475,10 @@ int main(int argc, char** argv)
             ROS_ERROR("[FAST_LIO_Relocation] Failed to initialize prior map.");
             return -1;
         }
+
+        publish_prior_map(pubLaserCloudMap);
+        prior_map_published_once = true;
+        ROS_INFO("[FAST_LIO_Relocation] Prior map published as latched topic /Laser_map.");
     }
     /* ================= FAST_LIO_Relocation modification ================= */
 //------------------------------------------------------------------------------------------------------
@@ -1132,6 +1507,29 @@ int main(int argc, char** argv)
             solve_const_H_time = 0;
             svd_time   = 0;
             t0 = omp_get_wtime();
+
+            if (is_localization_mode() && tracking_state == TRACKING_LOST)
+            {
+                if (has_last_locked_state)
+                {
+                    kf.change_x(last_locked_state);
+                    state_point = last_locked_state;
+                }
+                else
+                {
+                    state_point = kf.get_x();
+                }
+
+                refresh_pose_cache_from_state();
+
+                publish_odometry(pubOdomAftMapped);
+                if (path_en) publish_path(pubPath);
+                publish_localization_status_overlay(pubLocalizationOverlayText);
+
+                status = ros::ok();
+                rate.sleep();
+                continue;
+            }
 
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
@@ -1215,14 +1613,60 @@ int main(int argc, char** argv)
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+
+            /* 中文注释：
+            保存更新前状态，用于更新后验门控 */
+            state_ikfom state_before_update = kf.get_x();
+            auto P_before_update = kf.get_P();
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-            state_point = kf.get_x();
-            euler_cur = SO3ToEuler(state_point.rot);
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            geoQuat.x = state_point.rot.coeffs()[0];
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
+
+            state_ikfom state_after_update = kf.get_x();
+
+            /* 中文注释：
+            对优化后的位姿跳变量做合理性检查
+            若当前帧更新不合理，则回退到更新前状态 */
+            if (is_localization_mode() &&
+                !check_pose_update_reasonable(state_before_update, state_after_update))
+            {
+                kf.change_x(state_before_update);
+                kf.change_P(P_before_update);
+                state_point = state_before_update;
+                accept_lidar_update = false;
+            }
+            else
+            {
+                state_point = state_after_update;
+                accept_lidar_update = true;
+            }
+
+            refresh_pose_cache_from_state();
+            /* 中文注释：
+            localization 模式下更新定位状态机 */
+            if (is_localization_mode())
+            {
+                update_tracking_state_machine();
+
+                if (tracking_state == TRACKING_LOST)
+                {
+                    ROS_WARN_THROTTLE(1.0, "[FAST_LIO_Relocation] Tracking LOST.");
+
+                    if (has_last_locked_state)
+                    {
+                        kf.change_x(last_locked_state);
+                        state_point = last_locked_state;
+                    }
+
+                    refresh_pose_cache_from_state();
+
+                    publish_odometry(pubOdomAftMapped);
+                    if (path_en) publish_path(pubPath);
+                    publish_localization_status_overlay(pubLocalizationOverlayText);
+
+                    status = ros::ok();
+                    rate.sleep();
+                    continue;
+                }
+            }
 
             double t_update_end = omp_get_wtime();
 
@@ -1252,11 +1696,14 @@ int main(int argc, char** argv)
             if (path_en)                         publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            if (is_localization_mode())
+            {
+                publish_localization_status_overlay(pubLocalizationOverlayText);
+            }
             // publish_effect_world(pubLaserCloudEffect);
 
             /* 
-            定位模式下先验地图只需启动后发布一次，
-            后续低频补发即可，避免每帧重复发送整张地图。 */
+            定位模式下先验地图首次发布一次，后续低频补发 */
             if (is_localization_mode())
             {
                 prior_map_pub_counter++;
