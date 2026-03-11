@@ -84,6 +84,37 @@ condition_variable sig_buffer;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
+/* ================= FAST_LIO_Relocation modification ================= */
+/* 运行模式定义
+   MODE_MAPPING        : 原始 FAST-LIO 建图模式
+   MODE_LOCALIZATION   : 使用已有 PCD 地图进行定位 */
+enum RunMode
+{
+    MODE_MAPPING = 0,
+    MODE_LOCALIZATION = 1
+};
+
+/* 当前运行模式 */
+int run_mode = MODE_MAPPING;
+
+/* 是否已经成功加载先验地图 */
+bool prior_map_loaded = false;
+
+/* 是否已经使用先验地图初始化 ikdtree */
+bool prior_map_tree_built = false;
+
+/* 存储读取的 PCD 地图 */
+PointCloudXYZI::Ptr prior_map_raw(new PointCloudXYZI());
+PointCloudXYZI::Ptr prior_map_ds(new PointCloudXYZI());
+
+/* PCD 地图体素降采样大小 */
+double map_voxel_size = 0.5;
+
+/* 先验地图发布控制 */
+bool prior_map_published_once = false;
+int prior_map_pub_counter = 0;
+int prior_map_pub_interval = 50;
+/* ================= FAST_LIO_Relocation modification ================= */
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -423,6 +454,130 @@ bool sync_packages(MeasureGroup &meas)
     return true;
 }
 
+inline bool is_mapping_mode()
+{
+    return run_mode == MODE_MAPPING;
+}
+
+inline bool is_localization_mode()
+{
+    return run_mode == MODE_LOCALIZATION;
+}
+
+inline bool allow_map_update()
+{
+    /* 中文注释：
+       在重定位模式下地图是固定的，不允许新增或删除点
+       只有 mapping 模式允许更新地图 */
+    return run_mode == MODE_MAPPING;
+}
+
+bool load_prior_map_from_pcd(const std::string &pcd_path,
+                             PointCloudXYZI::Ptr cloud_raw,
+                             PointCloudXYZI::Ptr cloud_ds)
+{
+    /* 中文注释：
+       从磁盘读取 PCD 地图
+       并进行体素降采样
+       该函数只在重定位模式下使用 */
+
+    if (pcd_path.empty())
+    {
+        ROS_ERROR("[FAST_LIO_Relocation] map_file_path is empty.");
+        return false;
+    }
+
+    if (pcl::io::loadPCDFile<PointType>(pcd_path, *cloud_raw) < 0)
+    {
+        ROS_ERROR_STREAM("[FAST_LIO_Relocation] Failed to load map: " << pcd_path);
+        return false;
+    }
+
+    if (cloud_raw->empty())
+    {
+        ROS_ERROR("[FAST_LIO_Relocation] Loaded map is empty.");
+        return false;
+    }
+
+    pcl::VoxelGrid<PointType> prior_filter;
+    prior_filter.setLeafSize(map_voxel_size, map_voxel_size, map_voxel_size);
+    prior_filter.setInputCloud(cloud_raw);
+    prior_filter.filter(*cloud_ds);
+
+    if (cloud_ds->empty())
+    {
+        ROS_ERROR("[FAST_LIO_Relocation] Downsampled map is empty.");
+        return false;
+    }
+
+    ROS_INFO_STREAM("[FAST_LIO_Relocation] Prior map loaded. Raw size = "
+                    << cloud_raw->size()
+                    << ", downsampled size = "
+                    << cloud_ds->size());
+
+    return true;
+}
+
+bool init_localization_map_from_prior()
+{
+    /* 中文注释：
+       在定位模式下
+       从 PCD 地图构建 ikdtree
+       该过程只执行一次 */
+
+    if (prior_map_tree_built)
+    {
+        ROS_WARN("[FAST_LIO_Relocation] Prior map already initialized.");
+        return true;
+    }
+
+    if (!load_prior_map_from_pcd(map_file_path, prior_map_raw, prior_map_ds))
+    {
+        return false;
+    }
+
+    ikdtree.set_downsample_param(map_voxel_size);
+    ikdtree.Build(prior_map_ds->points);
+
+    prior_map_loaded = true;
+    prior_map_tree_built = true;
+
+    ROS_INFO("[FAST_LIO_Relocation] ikdtree initialized from prior map.");
+
+    return true;
+}
+
+bool init_map_from_first_scan()
+{
+    /* 中文注释：
+       原始 FAST-LIO 的行为
+       在 mapping 模式下
+       使用第一帧点云初始化地图 */
+
+    if (feats_down_size <= 5)
+    {
+        ROS_WARN("Too few points to initialize map.");
+        return false;
+    }
+
+    ikdtree.set_downsample_param(filter_size_map_min);
+
+    feats_down_world->resize(feats_down_size);
+
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        pointBodyToWorld(&(feats_down_body->points[i]),
+                         &(feats_down_world->points[i]));
+    }
+
+    ikdtree.Build(feats_down_world->points);
+
+    ROS_INFO_STREAM("[FAST_LIO_Relocation] Map initialized from first scan. Size = "
+                    << feats_down_world->size());
+
+    return true;
+}
+
 int process_increments = 0;
 void map_incremental()
 {
@@ -493,7 +648,12 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
         sensor_msgs::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        /* 
+        世界系下点云发布到对应的全局坐标系，
+        mapping 模式为 camera_init，
+        relocalization 模式为 map。 */
+        std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+        laserCloudmsg.header.frame_id = world_frame;
         pubLaserCloudFull.publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -550,17 +710,21 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
 
 void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
 {
-    PointCloudXYZI::Ptr laserCloudWorld( \
+    PointCloudXYZI::Ptr laserCloudWorld(
                     new PointCloudXYZI(effct_feat_num, 1));
     for (int i = 0; i < effct_feat_num; i++)
     {
-        RGBpointBodyToWorld(&laserCloudOri->points[i], \
+        RGBpointBodyToWorld(&laserCloudOri->points[i],
                             &laserCloudWorld->points[i]);
     }
+
     sensor_msgs::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+
+    std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+    laserCloudFullRes3.header.frame_id = world_frame;
+
     pubLaserCloudEffect.publish(laserCloudFullRes3);
 }
 
@@ -569,7 +733,28 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
     sensor_msgs::PointCloud2 laserCloudMap;
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
     laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudMap.header.frame_id = "camera_init";
+
+    std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+    laserCloudMap.header.frame_id = world_frame;
+
+    pubLaserCloudMap.publish(laserCloudMap);
+}
+
+void publish_prior_map(const ros::Publisher & pubLaserCloudMap)
+{
+    /* 中文注释：
+       发布加载的先验地图
+       用于在 RViz 中查看固定地图 */
+
+    if (!prior_map_loaded || prior_map_ds->empty())
+    {
+        return;
+    }
+
+    sensor_msgs::PointCloud2 laserCloudMap;
+    pcl::toROSMsg(*prior_map_ds, laserCloudMap);
+    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudMap.header.frame_id = "map";
     pubLaserCloudMap.publish(laserCloudMap);
 }
 
@@ -588,11 +773,18 @@ void set_posestamp(T & out)
 
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
-    odomAftMapped.header.frame_id = "camera_init";
+    /* 
+       mapping 模式下，父坐标系为 camera_init；
+       relocalization 模式下，父坐标系为 map，
+       表示当前位姿是在先验 PCD 地图坐标系下估计得到的。 */
+    std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+
+    odomAftMapped.header.frame_id = world_frame;
     odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
+    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);
+
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -605,25 +797,38 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    pubOdomAftMapped.publish(odomAftMapped);
+
     static tf::TransformBroadcaster br;
-    tf::Transform                   transform;
-    tf::Quaternion                  q;
-    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                    odomAftMapped.pose.pose.position.y, \
+    tf::Transform transform;
+    tf::Quaternion q;
+    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x,
+                                    odomAftMapped.pose.pose.position.y,
                                     odomAftMapped.pose.pose.position.z));
     q.setW(odomAftMapped.pose.pose.orientation.w);
     q.setX(odomAftMapped.pose.pose.orientation.x);
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
-    transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+    transform.setRotation(q);
+
+    br.sendTransform(tf::StampedTransform(transform,
+                                          odomAftMapped.header.stamp,
+                                          world_frame,
+                                          "body"));
 }
 
 void publish_path(const ros::Publisher pubPath)
 {
+    /* ：
+       path 的父坐标系需要和 odometry 保持一致，
+       mapping 模式下为 camera_init，
+       relocalization 模式下为 map。 */
+    std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = world_frame;
+    path.header.frame_id = world_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -795,6 +1000,32 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    /* ================= FAST_LIO_Relocation modification ================= */
+    /* 读取运行模式参数 */
+    nh.param<int>("run_mode", run_mode, 0);
+
+    /* 读取地图体素大小 */
+    nh.param<double>("map_voxel_size", map_voxel_size, 0.5);
+    /* ================= FAST_LIO_Relocation modification ================= */
+
+    /* ================= FAST_LIO_Relocation modification ================= */
+    /* 判断当前运行模式 */
+
+    if (run_mode != MODE_MAPPING && run_mode != MODE_LOCALIZATION)
+    {
+        ROS_WARN("[FAST_LIO_Relocation] Invalid run_mode, fallback to MODE_MAPPING.");
+        run_mode = MODE_MAPPING;
+    }
+
+    if (is_localization_mode())
+    {
+        ROS_INFO("[FAST_LIO_Relocation] Running in LOCALIZATION mode.");
+    }
+    else
+    {
+        ROS_INFO("[FAST_LIO_Relocation] Running in MAPPING mode.");
+    }
+    /* ================= FAST_LIO_Relocation modification ================= */
 
     p_imu->set_gravity_align_enable(gravity_align_en);
     p_pre->lidar_type = lidar_type;
@@ -863,6 +1094,18 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    /* ================= FAST_LIO_Relocation modification ================= */
+    /* 如果是定位模式，在进入主循环前加载先验地图 */
+
+    if (is_localization_mode())
+    {
+        if (!init_localization_map_from_prior())
+        {
+            ROS_ERROR("[FAST_LIO_Relocation] Failed to initialize prior map.");
+            return -1;
+        }
+    }
+    /* ================= FAST_LIO_Relocation modification ================= */
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -903,28 +1146,38 @@ int main(int argc, char** argv)
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            /* ================= FAST_LIO_Relocation modification ================= */
+            /* 在定位模式下不允许删除地图点 */
+
+            if (is_mapping_mode())
+            {
+                lasermap_fov_segment();
+            }
+            /* ================= FAST_LIO_Relocation modification ================= */
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            /* ================= FAST_LIO_Relocation modification ================= */
+            /* ikdtree 初始化逻辑 */
+
+            if (ikdtree.Root_Node == nullptr)
             {
-                if(feats_down_size > 5)
+                if (is_localization_mode())
                 {
-                    ikdtree.set_downsample_param(filter_size_map_min);
-                    feats_down_world->resize(feats_down_size);
-                    for(int i = 0; i < feats_down_size; i++)
-                    {
-                        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-                    }
-                    ikdtree.Build(feats_down_world->points);
+                    ROS_ERROR("[FAST_LIO_Relocation] ikdtree should already be initialized from prior map.");
+                }
+                else
+                {
+                    init_map_from_first_scan();
                 }
                 continue;
             }
+            /* ================= FAST_LIO_Relocation modification ================= */
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
@@ -978,7 +1231,21 @@ int main(int argc, char** argv)
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
+
+            /* ================= FAST_LIO_Relocation modification ================= */
+            /* 在定位模式下禁止新增地图点 */
+
+            if (allow_map_update())
+            {
+                map_incremental();
+            }
+            else
+            {
+                kdtree_incremental_time = 0.0;
+                add_point_size = 0;
+            }
+            /* ================= FAST_LIO_Relocation modification ================= */
+
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -986,7 +1253,25 @@ int main(int argc, char** argv)
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
-            // publish_map(pubLaserCloudMap);
+
+            /* 
+            定位模式下先验地图只需启动后发布一次，
+            后续低频补发即可，避免每帧重复发送整张地图。 */
+            if (is_localization_mode())
+            {
+                prior_map_pub_counter++;
+
+                if (!prior_map_published_once || prior_map_pub_counter >= prior_map_pub_interval)
+                {
+                    publish_prior_map(pubLaserCloudMap);
+                    prior_map_published_once = true;
+                    prior_map_pub_counter = 0;
+                }
+            }
+            else
+            {
+                // publish_map(pubLaserCloudMap);
+            }
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1011,7 +1296,10 @@ int main(int argc, char** argv)
                 s_plot9[time_log_counter] = aver_time_consu;
                 s_plot10[time_log_counter] = add_point_size;
                 time_log_counter ++;
-                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
+                const char* mode_name = is_localization_mode() ? "localization" : "mapping";
+                printf("[ %s ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",
+                    mode_name, t1-t0, aver_time_match, aver_time_solve, t3-t1, t5-t3,
+                    aver_time_consu, aver_time_icp, aver_time_const_H_time);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
