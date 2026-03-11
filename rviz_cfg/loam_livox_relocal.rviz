@@ -13,6 +13,7 @@ Panels:
         - /Odometry1/Odometry1/Covariance1/Position1
         - /Odometry1/Odometry1/Covariance1/Orientation1
         - /MarkerArray1/Namespaces1
+        - /OverlayText1
       Splitter Ratio: 0.6432291865348816
     Tree Height: 777
   - Class: rviz/Selection
@@ -293,6 +294,27 @@ Visualization Manager:
         {}
       Queue Size: 100
       Value: false
+    - Align Bottom: false
+      Background Alpha: 0.800000011920929
+      Background Color: 0; 0; 0
+      Class: jsk_rviz_plugin/OverlayText
+      Enabled: true
+      Foreground Alpha: 0.800000011920929
+      Foreground Color: 25; 255; 240
+      Invert Shadow: true
+      Name: OverlayText
+      Overtake BG Color Properties: true
+      Overtake FG Color Properties: true
+      Overtake Position Properties: false
+      Topic: /localization_status_overlay
+      Value: true
+      font: DejaVu Sans Mono
+      height: 128
+      left: 0
+      line width: 2
+      text size: 12
+      top: 0
+      width: 128
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
@@ -329,9 +351,9 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -2.6073479652404785
-        Y: -14.8982515335083
-        Z: -6.336804389953613
+        X: -2.0159575939178467
+        Y: -15.2666654586792
+        Z: -5.941911220550537
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
