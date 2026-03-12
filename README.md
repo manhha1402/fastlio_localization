@@ -74,8 +74,8 @@ When LOST:
 - system rolls back to last_locked_state
 - pose output freezes
 
-System Pipeline
----
+#System Pipeline
+
 LiDAR + IMU  
 ↓  
 IMU propagation + undistortion  
@@ -95,7 +95,8 @@ Match quality evaluation
 State machine  
 ↓  
 Pose gating / rollback
----
+
+
 
 #Features
 ##Mapping Mode
@@ -122,13 +123,13 @@ Eigen
 jsk_rviz_plugins
 
 ##Installation
-···
+
 git clone https://github.com/JoCatW/FAST_LIO_Relocation.git
-···
+
 ##Build
-···
+
 catkin_make
-···
+
 
 
 #Commercial Use
