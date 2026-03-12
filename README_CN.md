@@ -12,6 +12,7 @@
 # 项目简介
 FAST_LIO_Relocation 是在 FAST-LIO 基础上实现的固定地图定位系统。
 系统加载先验 PCD 地图，并在该地图上运行 FAST-LIO **原生** scan-to-map + EKF 估计流程，同时增加定位鲁棒性控制机制。
+
 具体的开发流程可以看issue，当此项目stars达到80星时，将NDT加入的版本开源，并且更新ROS2版本，如果你喜欢这个项目的话，请您点点star~
 
 # 核心原理
