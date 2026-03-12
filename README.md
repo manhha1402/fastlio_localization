@@ -14,6 +14,10 @@ FAST_LIO_Relocation extends FAST-LIO from online mapping to prior-map-based loca
 FAST_LIO_Relocation transforms FAST-LIO into a fixed-map LiDAR localization system.
 Instead of continuously growing the map, the system loads a prior PCD map and performs localization against it while preserving FAST-LIO's original scan-to-map estimation pipeline.
 
+The system supports initial **gravity alignment**, and even with mid360 tilt mounting, it will directly generate a plane point cloud.
+
+The code for several branch branches of this project can be used for reference and will not be closed for the time being.
+
 For details on the development process, please refer to the issues. When this project reaches 80 stars, the version incorporating NDT will be open-sourced, and the ROS2 version will be updated. If you like this project, please give it a star!
 
 Core Principle
