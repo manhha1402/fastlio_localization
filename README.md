@@ -74,7 +74,7 @@ When LOST:
 - system rolls back to last_locked_state
 - pose output freezes
 
-#System Pipeline
+# System Pipeline
 
 LiDAR + IMU  
 ↓  
@@ -98,10 +98,10 @@ Pose gating / rollback
 
 
 
-#Features
-##Mapping Mode
+# Features
+## Mapping Mode
 - original FAST-LIO mapping
-##Localization Mode
+## Localization Mode
 - prior PCD map loading
 - voxel filtering
 - fixed-map localization
@@ -122,21 +122,21 @@ PCL
 Eigen
 jsk_rviz_plugins
 
-##Installation
+## Installation
 
 git clone https://github.com/JoCatW/FAST_LIO_Relocation.git
 
-##Build
+## Build
 
 catkin_make
 
 
 
-#Commercial Use
+# Commercial Use
 Academic research only.
 Commercial use requires permission.
 Contact
 jocatww@gmail.com
 
-#License
+# License
 GPL-3.0
