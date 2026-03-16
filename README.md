@@ -18,6 +18,9 @@ The system supports initial **gravity alignment**, and even with mid360 tilt mou
 
 The code for several branch branches of this project can be used for reference and will not be closed for the time being.
 
+Shown the system effect to see this video
+https://m.bilibili.com/video/BV1AqwHzsEBV
+
 For details on the development process, please refer to the issues. When this project reaches 80 stars, the version incorporating NDT will be open-sourced, and the ROS2 version will be updated. If you like this project, please give it a star!
 
 Core Principle
