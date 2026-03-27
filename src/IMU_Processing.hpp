@@ -6,33 +6,31 @@
 #include <fstream>
 #include <csignal>
 
-#include <ros/ros.h>
-#include <so3_math.h>
+#include <cassert>
+#include <omp.h>
+
+#include <rclcpp/rclcpp.hpp>
+#include <fastlio_localization/so3_math.h>
 #include <Eigen/Eigen>
 #include <Eigen/Geometry>
 
-#include <common_lib.h>
+#include <fastlio_localization/common_lib.h>
 #include <pcl/common/io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <condition_variable>
-#include <nav_msgs/Odometry.h>
 #include <pcl/common/transforms.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <tf/transform_broadcaster.h>
-#include <eigen_conversions/eigen_msg.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <geometry_msgs/Vector3.h>
+#include <sensor_msgs/msg/imu.hpp>
 
-#include "use-ikfom.hpp"
+#include <fastlio_localization/use-ikfom.hpp>
 #include "preprocess.h"
 
 /// *************Preconfiguration
 #define MAX_INI_COUNT (10)
 
-/// 点云按 curvature 字段排序
+/// Sort points by curvature field (per-point time proxy)
 const bool time_list(PointType &x, PointType &y) { return (x.curvature < y.curvature); };
 
 /// *************IMU Process and undistortion
@@ -45,7 +43,7 @@ class ImuProcess
   ~ImuProcess();
 
   void Reset();
-  void Reset(double start_timestamp, const sensor_msgs::ImuConstPtr &lastimu);
+  void Reset(double start_timestamp, const sensor_msgs::msg::Imu::ConstSharedPtr & lastimu);
   void set_extrinsic(const V3D &transl, const M3D &rot);
   void set_extrinsic(const V3D &transl);
   void set_extrinsic(const MD(4,4) &T);
@@ -54,7 +52,7 @@ class ImuProcess
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
 
-  /// 手动设置开关（可选）
+  /// Optional: enable/disable gravity alignment from YAML
   void set_gravity_align_enable(bool en) { gravity_align_en_ = en; }
 
   Eigen::Matrix<double, 12, 12> Q;
@@ -83,9 +81,9 @@ class ImuProcess
                     PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
-  sensor_msgs::ImuConstPtr last_imu_;
-  deque<sensor_msgs::ImuConstPtr> v_imu_;
-  vector<Pose6D> IMUpose;
+  sensor_msgs::msg::Imu::ConstSharedPtr last_imu_;
+  deque<sensor_msgs::msg::Imu::ConstSharedPtr> v_imu_;
+  vector<ImuPose6D> IMUpose;
   vector<M3D>    v_rot_pcl_;
 
   M3D Lidar_R_wrt_IMU;
@@ -104,14 +102,14 @@ class ImuProcess
   bool imu_need_init_ = true;
 
   // ===== gravity alignment switch =====
-  // 从 yaml 读取，决定是否启用“虚拟水平重力对齐”
+  // From YAML: enable virtual-level gravity alignment
   bool gravity_align_en_ = true;
 
   // ===== virtual level alignment =====
-  // 把“倾斜安装下测得的 IMU / 点云”旋到虚拟水平坐标系
+  // Rotate tilted-mount IMU / points into a virtual level frame
   Eigen::Quaterniond q_align_ = Eigen::Quaterniond::Identity();
 
-  // 是否已经成功求得对齐旋转
+  // True once alignment quaternion has been computed
   bool has_align_ = false;
 };
 
@@ -141,7 +139,7 @@ ImuProcess::ImuProcess()
   has_align_ = false;
 
   last_lidar_end_time_ = 0.0;
-  last_imu_.reset(new sensor_msgs::Imu());
+  last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
 
   gravity_align_en_ = true;
 
@@ -163,7 +161,7 @@ void ImuProcess::Reset()
   v_imu_.clear();
   IMUpose.clear();
 
-  last_imu_.reset(new sensor_msgs::Imu());
+  last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
   cur_pcl_un_.reset(new PointCloudXYZI());
 
   q_align_ = Eigen::Quaterniond::Identity();
@@ -172,7 +170,7 @@ void ImuProcess::Reset()
   last_lidar_end_time_ = 0.0;
 }
 
-void ImuProcess::Reset(double start_timestamp, const sensor_msgs::ImuConstPtr &lastimu)
+void ImuProcess::Reset(double start_timestamp, const sensor_msgs::msg::Imu::ConstSharedPtr & lastimu)
 {
   Reset();
   start_timestamp_ = start_timestamp;
@@ -223,10 +221,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas,
                           int &N)
 {
   /**
-   * 负责：
-   * 1. 累计静止阶段 IMU，估计 mean_acc / mean_gyr
-   * 2. 如果开关开启，则建立“虚拟水平坐标系”
-   * 3. 初始化滤波器状态
+   * IMU_init:
+   * 1. Accumulate static IMU to estimate mean_acc / mean_gyr
+   * 2. If enabled, build virtual level frame
+   * 3. Initialize filter state
    */
 
   V3D cur_acc, cur_gyr;
@@ -271,7 +269,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas,
   if (gravity_align_en_)
   {
     // ===== build virtual level frame =====
-    // 把当前 mean_acc 方向旋到 +Z
+    // Rotate mean_acc direction to +Z
     Eigen::Vector3d acc0(mean_acc.x(), mean_acc.y(), mean_acc.z());
     if (acc0.norm() > 1e-6)
     {
@@ -279,12 +277,12 @@ void ImuProcess::IMU_init(const MeasureGroup &meas,
       q_align_ = Eigen::Quaterniond::FromTwoVectors(acc0, Eigen::Vector3d::UnitZ());
       has_align_ = true;
 
-      // 把 mean_gyr 旋到虚拟水平系
+      // Rotate mean_gyr into virtual level frame
       Eigen::Vector3d gyr0(mean_gyr.x(), mean_gyr.y(), mean_gyr.z());
       gyr0 = q_align_ * gyr0;
       mean_gyr = V3D(gyr0.x(), gyr0.y(), gyr0.z());
 
-      // 把 mean_acc 也旋过去
+      // Rotate mean_acc as well
       Eigen::Vector3d acc1(mean_acc.x(), mean_acc.y(), mean_acc.z());
       acc1 = q_align_ * acc1;
       mean_acc = V3D(acc1.x(), acc1.y(), acc1.z());
@@ -295,20 +293,20 @@ void ImuProcess::IMU_init(const MeasureGroup &meas,
       has_align_ = false;
     }
 
-    // 输入数据已经会被旋到水平系，所以滤波器从 identity 开始
+    // Inputs will be rotated to level frame; start filter at identity rotation
     init_state.rot = Eye3d;
 
-    // 水平系下重力固定朝 -Z
+    // In level frame gravity is fixed along -Z
     init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
   }
   else
   {
-    // ===== 原版逻辑 =====
+    // ===== Original FAST-LIO path (no virtual level) =====
     q_align_ = Eigen::Quaterniond::Identity();
     has_align_ = false;
 
     init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
-    // 原版这里通常不主动设 rot
+    // Original code typically does not set rot explicitly here
   }
 
   init_state.bg  = mean_gyr;
@@ -336,8 +334,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas,
   auto v_imu = meas.imu;
   v_imu.push_front(last_imu_);
 
-  const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
-  const double &imu_end_time = v_imu.back()->header.stamp.toSec();
+  const double imu_beg_time = fastlio_ros2::stamp_to_sec(v_imu.front()->header.stamp);
+  const double imu_end_time = fastlio_ros2::stamp_to_sec(v_imu.back()->header.stamp);
   (void)imu_beg_time;
 
   double pcl_beg_time = meas.lidar_beg_time;
@@ -369,7 +367,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas,
     auto &&head = *(it_imu);
     auto &&tail = *(it_imu + 1);
 
-    if (tail->header.stamp.toSec() < last_lidar_end_time_) continue;
+    if (fastlio_ros2::stamp_to_sec(tail->header.stamp) < last_lidar_end_time_) continue;
 
     angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                   0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
@@ -392,10 +390,11 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas,
       acc_avr    = V3D(a.x(), a.y(), a.z());
     }
 
-    if (head->header.stamp.toSec() < last_lidar_end_time_)
-      dt = tail->header.stamp.toSec() - last_lidar_end_time_;
+    if (fastlio_ros2::stamp_to_sec(head->header.stamp) < last_lidar_end_time_)
+      dt = fastlio_ros2::stamp_to_sec(tail->header.stamp) - last_lidar_end_time_;
     else
-      dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
+      dt = fastlio_ros2::stamp_to_sec(tail->header.stamp) -
+        fastlio_ros2::stamp_to_sec(head->header.stamp);
 
     in.acc = acc_avr;
     in.gyro = angvel_avr;
@@ -415,7 +414,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas,
       acc_s_last[i] += imu_state.grav[i];
     }
 
-    double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;
+    double offs_t = fastlio_ros2::stamp_to_sec(tail->header.stamp) - pcl_beg_time;
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last,
                                  imu_state.vel, imu_state.pos,
                                  imu_state.rot.toRotationMatrix()));
@@ -439,11 +438,11 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas,
       auto head = it_kp - 1;
       auto tail = it_kp;
 
-      R_imu << MAT_FROM_ARRAY(head->rot);
-      vel_imu << VEC_FROM_ARRAY(head->vel);
-      pos_imu << VEC_FROM_ARRAY(head->pos);
-      acc_imu << VEC_FROM_ARRAY(tail->acc);
-      angvel_avr << VEC_FROM_ARRAY(tail->gyr);
+      R_imu = head->rot;
+      vel_imu = head->vel;
+      pos_imu = head->pos;
+      acc_imu = tail->acc;
+      angvel_avr = tail->gyr;
 
       for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--)
       {
@@ -499,7 +498,7 @@ void ImuProcess::Process(const MeasureGroup &meas,
   t1 = omp_get_wtime();
 
   if (meas.imu.empty()) { return; }
-  ROS_ASSERT(meas.lidar != nullptr);
+  assert(meas.lidar != nullptr);
 
   if (imu_need_init_)
   {
@@ -519,7 +518,7 @@ void ImuProcess::Process(const MeasureGroup &meas,
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
 
-      ROS_INFO("IMU Initial Done");
+      RCLCPP_INFO(rclcpp::get_logger("fastlio_imu"), "IMU Initial Done");
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
     }
 
