@@ -3,10 +3,10 @@
 
     <arg name="rviz" default="true" />
 
-    <!-- 读取重定位专用参数 -->
+    <!-- Load relocalization parameters -->
     <rosparam command="load" file="$(find fast_lio)/config/mid360_relocalization.yaml" />
 
-    <!-- 这些参数建议和 mapping 版本先保持一致，避免变量过多 -->
+    <!-- Keep these aligned with the mapping launch to limit parameter drift -->
     <param name="feature_extract_enable" type="bool" value="0"/>
     <param name="point_filter_num" type="int" value="3"/>
     <param name="max_iteration" type="int" value="3" />
