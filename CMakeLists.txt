@@ -73,7 +73,7 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(fastlio_mapping OpenMP::OpenMP_CXX)
 endif()
 
-install(DIRECTORY launch config rviz map params
+install(DIRECTORY launch config rviz map
   DESTINATION share/${PROJECT_NAME})
 
 ament_target_dependencies(fastlio_mapping

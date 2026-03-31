@@ -1,8 +1,8 @@
 /**:
   ros__parameters:
     run_mode: 1
-    map_file_path: "/home/hahm/vm/fastlio_ws/src/fastlio_localization/map/3dmap_vmo_6F.ply"
-    map_voxel_size: 0.3
+    map_file_path: "3dmap_vmo_36.ply"
+    map_voxel_size: 0.2
 
     common:
         lid_topic: "/livox/lidar"
