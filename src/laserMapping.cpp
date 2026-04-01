@@ -48,6 +48,7 @@
 #include <fastlio_localization/so3_math.h>
 #include <fstream>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <math.h>
@@ -75,9 +76,11 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
-
+#include <vm_navigation_msgs/msg/localization_status.hpp>
 static rclcpp::Node::SharedPtr g_node;
 static std::shared_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
+static rclcpp::Publisher<vm_navigation_msgs::msg::LocalizationStatus>::SharedPtr
+    g_pub_localization_status;
 
 #define LOG_ERROR(...) RCLCPP_ERROR(g_node->get_logger(), __VA_ARGS__)
 #define LOG_WARN(...) RCLCPP_WARN(g_node->get_logger(), __VA_ARGS__)
@@ -118,9 +121,14 @@ double time_diff_lidar_to_imu = 0.0;
 std::mutex mtx_buffer;
 std::condition_variable sig_buffer;
 
+std::mutex mtx_initial_pose;
+geometry_msgs::msg::PoseWithCovarianceStamped pending_initial_pose_msg;
+bool pending_initial_pose = false;
+
 std::string root_dir = ROOT_DIR;
 std::string map_file_path, lid_topic, imu_topic;
-
+const std::string map_frame_id = "3dmap";
+const std::string camera_init_frame_id = "camera_init";
 /* ================= FAST_LIO_Relocation modification ================= */
 /* Run mode:
    MODE_MAPPING        : original FAST-LIO mapping
@@ -517,8 +525,8 @@ bool sync_packages(MeasureGroup &meas) {
            lidar_mean_scantime) /
           scan_num;
     }
-    if (lidar_type == MARSIM)
-      lidar_end_time = meas.lidar_beg_time;
+    //if (lidar_type == MARSIM)
+    //  lidar_end_time = meas.lidar_beg_time;
 
     meas.lidar_end_time = lidar_end_time;
 
@@ -577,6 +585,121 @@ void save_last_tracking_state() {
 void save_last_locked_state() {
   last_locked_state = state_point;
   has_last_locked_state = true;
+}
+
+/** When LOST: freeze pose at last acceptable match (tracked), else last locked
+ *  good pose, else keep current EKF state. */
+void apply_lost_hold_pose() {
+  if (has_last_tracking_state) {
+    kf.change_x(last_tracking_state);
+    state_point = last_tracking_state;
+  } else if (has_last_locked_state) {
+    kf.change_x(last_locked_state);
+    state_point = last_locked_state;
+  } else {
+    state_point = kf.get_x();
+  }
+}
+
+void refresh_pose_cache_from_state();
+
+/** RViz2 "2D Pose Estimate" /initialpose: body pose in map (same as /Odometry). */
+static void initial_pose_callback(
+    const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+  if (!is_localization_mode()) {
+    LOG_WARN_THROTTLE(5000,
+                      "/initialpose ignored: not in localization mode");
+    return;
+  }
+  /* LocalizationStatus publishes UNLOCKED as "LOST" (only TRACKING→DEGRADED,
+   * LOCKED→GOOD). User must be able to set pose while UNLOCKED (startup /
+   * never locked). Reject only when already LOCKED. */
+  if (tracking_state == TRACKING_LOCKED) {
+    LOG_WARN_THROTTLE(
+        3000,
+        "/initialpose ignored: localization is LOCKED (GOOD); use when "
+        "UNLOCKED, DEGRADED, or LOST");
+    return;
+  }
+  if (!msg->header.frame_id.empty() && msg->header.frame_id != map_frame_id) {
+    LOG_WARN(
+        "/initialpose frame_id is '%s' (expected 'map'); applying anyway",
+        msg->header.frame_id.c_str()); 
+  }
+  std::lock_guard<std::mutex> lk(mtx_initial_pose);
+  pending_initial_pose_msg = *msg;
+  pending_initial_pose = true;
+  LOG_WARN(
+      "[FAST_LIO_Relocation] Queued /initialpose for relocalization on next "
+      "cycle");
+}
+
+static void try_apply_pending_initial_pose() {
+  geometry_msgs::msg::PoseWithCovarianceStamped msg_copy;
+  bool have = false;
+  {
+    std::lock_guard<std::mutex> lk(mtx_initial_pose);
+    if (!pending_initial_pose) {
+      return;
+    }
+    msg_copy = pending_initial_pose_msg;
+    pending_initial_pose = false;
+    have = true;
+  }
+  if (!have || !is_localization_mode()) {
+    return;
+  }
+  if (tracking_state == TRACKING_LOCKED) {
+    LOG_WARN_THROTTLE(2000,
+                      "Discarded queued /initialpose: state is LOCKED (GOOD)");
+    return;
+  }
+
+  const auto &p = msg_copy.pose.pose.position;
+  const auto &o = msg_copy.pose.pose.orientation;
+  Eigen::Quaterniond q(o.w, o.x, o.y, o.z);
+  if (q.squaredNorm() < 1e-18) {
+    LOG_WARN("Ignored /initialpose: invalid quaternion");
+    return;
+  }
+  q.normalize();
+
+  state_point = kf.get_x();
+  const double z_prev = state_point.pos(2);
+  state_point.pos << p.x, p.y, p.z;
+  /* RViz "2D Pose Estimate" usually sends z = 0. Keeping prior z keeps the scan
+   * on the same vertical slice as the prior map for point-to-plane matching. */
+  if (std::abs(p.z) < 1e-3) {
+    state_point.pos(2) = z_prev;
+  }
+  state_point.rot = SO3(q.w(), q.x(), q.y(), q.z());
+  state_point.vel << 0.0, 0.0, 0.0;
+  kf.change_x(state_point);
+
+  /* change_x() does not touch P. After a long LOCKED run P is tiny, Kalman gain
+   * suppresses lidar corrections — scan stays misaligned despite a good click.
+   * Inflate pose block so iterated updates can pull pose toward the map. */
+  {
+    auto P = kf.get_P();
+    constexpr double infl_pos = 25.0; // ~5 m std on x,y,z
+    constexpr double infl_rot = 0.35; // ~0.59 rad std on roll/pitch/yaw axes
+    for (int d = 0; d < 3; ++d) {
+      P(d, d) += infl_pos;
+      P(d + 3, d + 3) += infl_rot;
+    }
+    kf.change_P(P);
+  }
+
+  tracking_state = TRACKING_UNLOCKED;
+  acceptable_match_streak = 0;
+  good_match_streak = 0;
+  bad_match_streak = 0;
+  save_last_tracking_state();
+  save_last_locked_state();
+
+  refresh_pose_cache_from_state();
+  LOG_WARN("[FAST_LIO_Relocation] Applied /initialpose: EKF pose reset, "
+           "tracking → UNLOCKED for relocalization");
 }
 
 bool is_match_acceptable() {
@@ -695,6 +818,31 @@ void update_tracking_state_machine() {
      */
     return;
   }
+}
+
+/** Publish vm_navigation_msgs/LocalizationStatus from FAST-LIO tracking state.
+ *  TRACKING_LOCKED → GOOD, TRACKING_TRACKING → DEGRADED, else → LOST. */
+static void publish_localization_status() {
+  if (!g_pub_localization_status || !g_node) {
+    return;
+  }
+  vm_navigation_msgs::msg::LocalizationStatus msg;
+  msg.header.stamp = g_node->now();
+  msg.header.frame_id = map_frame_id;
+  if (tracking_state == TRACKING_LOCKED) {
+    msg.status = "GOOD";
+  } else if (tracking_state == TRACKING_TRACKING) {
+    msg.status = "DEGRADED";
+  } else {
+    msg.status = "LOST";
+  }
+  msg.inlier_rmse = res_mean_last;
+  msg.fitness_score =
+      current_match_good
+          ? std::max(0.0, 1.0 - std::min(1.0, res_mean_last))
+          : 0.0;
+  msg.pose_distance_error = 0.0;
+  g_pub_localization_status->publish(msg);
 }
 
 bool check_pose_update_reasonable(const state_ikfom &state_before,
@@ -979,7 +1127,7 @@ void publish_frame_world(
     set_publish_stamp(laserCloudmsg.header.stamp);
     /* World-frame cloud: frame_id is camera_init (mapping) or map
      * (localization). */
-    std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+    std::string world_frame = is_localization_mode() ? map_frame_id : camera_init_frame_id;
     laserCloudmsg.header.frame_id = world_frame;
     pubLaserCloudFull->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
@@ -1047,7 +1195,7 @@ void publish_effect_world(
   pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
   set_publish_stamp(laserCloudFullRes3.header.stamp);
 
-  std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+  std::string world_frame = is_localization_mode() ? map_frame_id : camera_init_frame_id;
   laserCloudFullRes3.header.frame_id = world_frame;
 
   pubLaserCloudEffect->publish(laserCloudFullRes3);
@@ -1060,7 +1208,7 @@ void publish_map(
   pcl::toROSMsg(*featsFromMap, laserCloudMap);
   set_publish_stamp(laserCloudMap.header.stamp);
 
-  std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+  std::string world_frame = is_localization_mode() ? map_frame_id : camera_init_frame_id;
   laserCloudMap.header.frame_id = world_frame;
 
   pubLaserCloudMap->publish(laserCloudMap);
@@ -1102,7 +1250,7 @@ void publish_prior_map(
 
   /* Same parent frame as odometry / registered cloud in localization (map). */
   laserCloudMap.header.frame_id =
-      is_localization_mode() ? "map" : "camera_init";
+      is_localization_mode() ? map_frame_id : camera_init_frame_id;
   pubLaserCloudMap->publish(laserCloudMap);
 }
 
@@ -1209,7 +1357,7 @@ void publish_odometry(
         &pubOdomAftMapped) {
   /* Odometry parent frame: camera_init (mapping) or map (localization, pose in
    * prior map). */
-  std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+  std::string world_frame = is_localization_mode() ? map_frame_id : camera_init_frame_id;
 
   odomAftMapped.header.frame_id = world_frame;
   odomAftMapped.child_frame_id = "body";
@@ -1246,7 +1394,7 @@ void publish_odometry(
 void publish_path(
     const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath) {
   /* Path uses the same parent frame as odometry: camera_init or map. */
-  std::string world_frame = is_localization_mode() ? "map" : "camera_init";
+  std::string world_frame = is_localization_mode() ? map_frame_id : camera_init_frame_id;
 
   set_posestamp(msg_body_pose);
   set_publish_stamp(msg_body_pose.header.stamp);
@@ -1418,7 +1566,9 @@ int main(int argc, char **argv) {
   b_gyr_cov = node->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
   b_acc_cov = node->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
   p_pre->blind = node->declare_parameter<double>("preprocess.blind", 0.01);
-  lidar_type = node->declare_parameter<int>("preprocess.lidar_type", AVIA);
+  lidar_type = node->declare_parameter<int>("preprocess.lidar_type", LIVOX);
+  const bool lidar_qos_sensor_data =
+      node->declare_parameter<bool>("preprocess.lidar_qos_sensor_data", false);
   p_pre->N_SCANS = node->declare_parameter<int>("preprocess.scan_line", 16);
   p_pre->time_unit =
       node->declare_parameter<int>("preprocess.timestamp_unit", US);
@@ -1494,7 +1644,7 @@ int main(int argc, char **argv) {
   std::cout << "p_pre->lidar_type " << p_pre->lidar_type << std::endl;
 
   path.header.stamp = g_node->get_clock()->now();
-  path.header.frame_id = is_localization_mode() ? "map" : "camera_init";
+  path.header.frame_id = is_localization_mode() ? map_frame_id : camera_init_frame_id;
 
   /*** variables definition ***/
   int frame_num = 0;
@@ -1554,15 +1704,35 @@ int main(int argc, char **argv) {
 
   rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_livox;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_std;
-  if (p_pre->lidar_type == AVIA) {
+  if (p_pre->lidar_type == LIVOX) {
     sub_livox = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
         lid_topic, qos_lidar, livox_pcl_cbk);
   } else {
+    /* SIM / many simulators publish PointCloud2 with BEST_EFFORT; a RELIABLE
+     * subscriber never matches and receives no data (DDS incompatibility). */
+    rclcpp::QoS qos_pc(rclcpp::KeepLast(2000));
+    qos_pc.durability_volatile();
+    if (lidar_type == SIM || lidar_qos_sensor_data) {
+      qos_pc.best_effort();
+    } else {
+      qos_pc.reliable();
+    }
     sub_pcl_std = node->create_subscription<sensor_msgs::msg::PointCloud2>(
-        lid_topic, qos_lidar, standard_pcl_cbk);
+        lid_topic, qos_pc, standard_pcl_cbk);
   }
   auto sub_imu = node->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, qos_imu, imu_cbk);
+
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+      sub_initial_pose;
+  if (is_localization_mode()) {
+    sub_initial_pose =
+        node->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/initialpose", 50,
+            [](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+              initial_pose_callback(msg);
+            });
+  }
 
   auto pubLaserCloudFull =
       node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered",
@@ -1578,6 +1748,11 @@ int main(int argc, char **argv) {
   auto pubOdomAftMapped =
       node->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_pub);
   auto pubPath = node->create_publisher<nav_msgs::msg::Path>("/path", qos_pub);
+  if (is_localization_mode()) {
+    g_pub_localization_status =
+        node->create_publisher<vm_navigation_msgs::msg::LocalizationStatus>(
+            "/localization_status", rclcpp::QoS(10).reliable());
+  }
   // pubLocalizationOverlayText = nh.advertise<jsk_rviz_plugins::OverlayText>
   //     ("/localization_status_overlay", 10);
   /* ================= FAST_LIO_Relocation modification ================= */
@@ -1590,7 +1765,7 @@ int main(int argc, char **argv) {
       return -1;
     }
 
-    /* Register frame "map" in tf2 and align stamps before first /Laser_map
+    /* Register frame map_frame_id in tf2 and align stamps before first /Laser_map
      * (RViz needs map->body). */
     state_point = kf.get_x();
     refresh_pose_cache_from_state();
@@ -1611,10 +1786,12 @@ int main(int argc, char **argv) {
   (void)sub_imu;
   (void)sub_livox;
   (void)sub_pcl_std;
+  (void)sub_initial_pose;
   while (status) {
     if (flg_exit)
       break;
     exec.spin_some();
+    try_apply_pending_initial_pose();
     if (sync_packages(Measures)) {
       if (flg_first_scan) {
         first_lidar_time = Measures.lidar_beg_time;
@@ -1632,19 +1809,29 @@ int main(int argc, char **argv) {
       t0 = omp_get_wtime();
 
       if (is_localization_mode() && tracking_state == TRACKING_LOST) {
-        if (has_last_locked_state) {
-          kf.change_x(last_locked_state);
-          state_point = last_locked_state;
-        } else {
-          state_point = kf.get_x();
+        /* Undistort current scan, then publish in map using last tracked pose
+         * (last_tracking_state), else last_locked_state, matching odometry. */
+        p_imu->Process(Measures, kf, feats_undistort);
+        state_point = kf.get_x();
+        pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+        if (feats_undistort->empty() || (feats_undistort == NULL)) {
+          LOG_WARN("No point, skip this scan!\n");
+          continue;
         }
+        downSizeFilterSurf.setInputCloud(feats_undistort);
+        downSizeFilterSurf.filter(*feats_down_body);
 
+        apply_lost_hold_pose();
         refresh_pose_cache_from_state();
 
         publish_odometry(pubOdomAftMapped);
         if (path_en)
           publish_path(pubPath);
-        // publish_localization_status_overlay(pubLocalizationOverlayText);
+        if (scan_pub_en || pcd_save_en)
+          publish_frame_world(pubLaserCloudFull);
+        if (scan_pub_en && scan_body_pub_en)
+          publish_frame_body(pubLaserCloudFull_body);
+        publish_localization_status();
 
         status = rclcpp::ok();
         rate.sleep();
@@ -1694,9 +1881,7 @@ int main(int argc, char **argv) {
       /* ================= FAST_LIO_Relocation modification ================= */
       kdtree_size_st = ikdtree.size();
 
-      // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<"
-      // downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect
-      // num:"<<effct_feat_num<<endl;
+
 
       /*** ICP and iterated Kalman filter update ***/
       if (feats_down_size < 5) {
@@ -1760,17 +1945,17 @@ int main(int argc, char **argv) {
         if (tracking_state == TRACKING_LOST) {
           LOG_WARN_THROTTLE(1000, "[FAST_LIO_Relocation] Tracking LOST.");
 
-          if (has_last_locked_state) {
-            kf.change_x(last_locked_state);
-            state_point = last_locked_state;
-          }
-
+          apply_lost_hold_pose();
           refresh_pose_cache_from_state();
 
           publish_odometry(pubOdomAftMapped);
           if (path_en)
             publish_path(pubPath);
-          // publish_localization_status_overlay(pubLocalizationOverlayText);
+          if (scan_pub_en || pcd_save_en)
+            publish_frame_world(pubLaserCloudFull);
+          if (scan_pub_en && scan_body_pub_en)
+            publish_frame_body(pubLaserCloudFull_body);
+          publish_localization_status();
 
           status = rclcpp::ok();
           rate.sleep();
@@ -1807,7 +1992,7 @@ int main(int argc, char **argv) {
       if (scan_pub_en && scan_body_pub_en)
         publish_frame_body(pubLaserCloudFull_body);
       if (is_localization_mode()) {
-        // publish_localization_status_overlay(pubLocalizationOverlayText);
+        publish_localization_status();
       }
       // publish_effect_world(pubLaserCloudEffect);
 

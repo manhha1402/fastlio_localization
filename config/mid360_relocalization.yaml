@@ -11,7 +11,11 @@
         time_offset_lidar_to_imu: 0.0
 
     preprocess:
+        # lidar_type: 1=LIVOX, 2=VELO16, 3=OUST64, 4=MARSIM, 5=SIM (xyz PointCloud2)
+        # Optional launch override: ros2 launch ... lidar_type:=5
         lidar_type: 1
+        # If true, PointCloud2 sub uses best_effort (use when publisher is not reliable)
+        lidar_qos_sensor_data: false
         scan_line: 4
         blind: 0.5
 

@@ -4,7 +4,7 @@
 #define RETURN0AND1 0x10
 
 Preprocess::Preprocess()
-    : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1) {
+    : feature_enabled(0), lidar_type(LIVOX), blind(0.01), point_filter_num(1) {
   inf_bound = 10;
   N_SCANS = 6;
   SCAN_RATE = 10;
@@ -42,7 +42,7 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num) {
 void Preprocess::process(
     const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg,
     PointCloudXYZI::Ptr &pcl_out) {
-  avia_handler(msg);
+  livox_handler(msg);
   *pcl_out = pl_surf;
 }
 
@@ -79,7 +79,9 @@ void Preprocess::process(
   case MARSIM:
     sim_handler(msg);
     break;
-
+  case SIM:
+    pointcloud2_xyz_handler(msg);
+    break;
   default:
     printf("Error LiDAR Type");
     break;
@@ -87,7 +89,7 @@ void Preprocess::process(
   *pcl_out = pl_surf;
 }
 
-void Preprocess::avia_handler(
+void Preprocess::livox_handler(
     const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg) {
   pl_surf.clear();
   pl_corn.clear();
@@ -443,27 +445,60 @@ void Preprocess::sim_handler(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
   pl_surf.clear();
   pl_full.clear();
-  pcl::PointCloud<pcl::PointXYZI> pl_orig;
+  /* Isaac Sim / generic sim often publishes xyz only (no intensity). */
+  pcl::PointCloud<pcl::PointXYZ> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.size();
-  pl_surf.reserve(plsize);
+  int plsize = static_cast<int>(pl_orig.size());
+  pl_surf.reserve(static_cast<size_t>(plsize));
   for (int i = 0; i < pl_orig.points.size(); i++) {
     double range = pl_orig.points[i].x * pl_orig.points[i].x +
                    pl_orig.points[i].y * pl_orig.points[i].y +
                    pl_orig.points[i].z * pl_orig.points[i].z;
     if (range < blind * blind)
       continue;
-    Eigen::Vector3d pt_vec;
     PointType added_pt;
     added_pt.x = pl_orig.points[i].x;
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
+    added_pt.intensity = 0.f;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
     added_pt.curvature = 0.0;
     pl_surf.points.push_back(added_pt);
+  }
+}
+
+void Preprocess::pointcloud2_xyz_handler(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<pcl::PointXYZ> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  const int plsize = static_cast<int>(pl_orig.points.size());
+  if (plsize == 0) {
+    return;
+  }
+  pl_surf.reserve(static_cast<size_t>(plsize));
+
+  for (int i = 0; i < plsize; ++i) {
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pl_orig.points[i].x;
+    added_pt.y = pl_orig.points[i].y;
+    added_pt.z = pl_orig.points[i].z;
+    added_pt.intensity = 0.f;
+    added_pt.curvature = 0.f;
+
+    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y +
+            added_pt.z * added_pt.z >
+        (blind * blind)) {
+      pl_surf.points.push_back(added_pt);
+    }
   }
 }
 
@@ -766,7 +801,7 @@ int Preprocess::plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types,
     return 0;
   }
 
-  if (lidar_type == AVIA) {
+  if (lidar_type == LIVOX) {
     double dismax_mid = disarr[0] / disarr[disarrsize / 2];
     double dismid_min = disarr[disarrsize / 2] / disarr[disarrsize - 2];
 
