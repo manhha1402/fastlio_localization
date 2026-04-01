@@ -51,6 +51,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(vm_navigation_msgs REQUIRED)
 
 
 add_executable(fastlio_mapping
@@ -85,6 +86,7 @@ ament_target_dependencies(fastlio_mapping
   std_msgs
   tf2
   tf2_ros
+  vm_navigation_msgs
 )
 
 ament_target_dependencies(fastlio_mapping livox_ros_driver2)

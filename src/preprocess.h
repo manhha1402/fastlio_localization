@@ -14,7 +14,7 @@ using namespace std;
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
-enum LID_TYPE { AVIA = 1, VELO16, OUST64, MARSIM }; //{1, 2, 3}
+enum LID_TYPE { LIVOX = 1, VELO16, OUST64, MARSIM, SIM }; //{1, 2, 3}
 enum TIME_UNIT { SEC = 0, MS = 1, US = 2, NS = 3 };
 enum Feature {
   Nor,
@@ -104,10 +104,12 @@ class Preprocess
   bool feature_enabled, given_offset_time;
 
   private:
-  void avia_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr & msg);
+  void livox_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr & msg);
   void oust64_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
   void sim_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg);
+  void pointcloud2_xyz_handler(
+      const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void give_feature(PointCloudXYZI & pl, vector<orgtype> & types);
   void pub_func(PointCloudXYZI & pl, double stamp_sec);
   int  plane_judge(const PointCloudXYZI & pl, vector<orgtype> & types, uint i, uint & i_nex, Eigen::Vector3d & curr_direct);
