@@ -614,13 +614,13 @@ static void initial_pose_callback(
   /* LocalizationStatus publishes UNLOCKED as "LOST" (only TRACKING→DEGRADED,
    * LOCKED→GOOD). User must be able to set pose while UNLOCKED (startup /
    * never locked). Reject only when already LOCKED. */
-  if (tracking_state == TRACKING_LOCKED) {
-    LOG_WARN_THROTTLE(
-        3000,
-        "/initialpose ignored: localization is LOCKED (GOOD); use when "
-        "UNLOCKED, DEGRADED, or LOST");
-    return;
-  }
+  // if (tracking_state == TRACKING_LOCKED) {
+  //   LOG_WARN_THROTTLE(
+  //       3000,
+  //       "/initialpose ignored: localization is LOCKED (GOOD); use when "
+  //       "UNLOCKED, DEGRADED, or LOST");
+  //   return;
+  // }
   if (!msg->header.frame_id.empty() && msg->header.frame_id != map_frame_id) {
     LOG_WARN(
         "/initialpose frame_id is '%s' (expected 'map'); applying anyway",
@@ -649,11 +649,11 @@ static void try_apply_pending_initial_pose() {
   if (!have || !is_localization_mode()) {
     return;
   }
-  if (tracking_state == TRACKING_LOCKED) {
-    LOG_WARN_THROTTLE(2000,
-                      "Discarded queued /initialpose: state is LOCKED (GOOD)");
-    return;
-  }
+  // if (tracking_state == TRACKING_LOCKED) {
+  //   LOG_WARN_THROTTLE(2000,
+  //                     "Discarded queued /initialpose: state is LOCKED (GOOD)");
+  //   return;
+  // }
 
   const auto &p = msg_copy.pose.pose.position;
   const auto &o = msg_copy.pose.pose.orientation;
