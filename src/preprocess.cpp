@@ -445,22 +445,22 @@ void Preprocess::sim_handler(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
   pl_surf.clear();
   pl_full.clear();
-  /* Isaac Sim / generic sim often publishes xyz only (no intensity). */
-  pcl::PointCloud<pcl::PointXYZ> pl_orig;
+  pcl::PointCloud<pcl::PointXYZI> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = static_cast<int>(pl_orig.size());
-  pl_surf.reserve(static_cast<size_t>(plsize));
+  int plsize = pl_orig.size();
+  pl_surf.reserve(plsize);
   for (int i = 0; i < pl_orig.points.size(); i++) {
     double range = pl_orig.points[i].x * pl_orig.points[i].x +
                    pl_orig.points[i].y * pl_orig.points[i].y +
                    pl_orig.points[i].z * pl_orig.points[i].z;
     if (range < blind * blind)
       continue;
+    Eigen::Vector3d pt_vec;
     PointType added_pt;
     added_pt.x = pl_orig.points[i].x;
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = 0.f;
+    added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
