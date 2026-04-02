@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <fastlio_localization/ikd-Tree/ikd_Tree.h>
 #include <fastlio_localization/ros2_time.hpp>
@@ -56,12 +57,15 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <omp.h>
+#include <pcl/common/io.h>
+#include <pcl/conversions.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/PCLPointCloud2.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -77,6 +81,7 @@
 #include <memory>
 #include <sstream>
 #include <vm_navigation_msgs/msg/localization_status.hpp>
+
 static rclcpp::Node::SharedPtr g_node;
 static std::shared_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
 static rclcpp::Publisher<vm_navigation_msgs::msg::LocalizationStatus>::SharedPtr
@@ -668,10 +673,13 @@ static void try_apply_pending_initial_pose() {
   const double z_prev = state_point.pos(2);
   state_point.pos << p.x, p.y, p.z;
   /* RViz "2D Pose Estimate" usually sends z = 0. Keeping prior z keeps the scan
-   * on the same vertical slice as the prior map for point-to-plane matching. */
-  if (std::abs(p.z) < 1e-3) {
-    state_point.pos(2) = z_prev;
-  }
+   * on the same vertical slice as the prior map for point-to-plane matching.
+    Set z = 0 since 3dmap.ply has z = 0
+   */
+  // if (std::abs(p.z) < 1e-3) {
+  //   state_point.pos(2) = z_prev;
+  // }
+  state_point.pos(2) = 0;
   state_point.rot = SO3(q.w(), q.x(), q.y(), q.z());
   state_point.vel << 0.0, 0.0, 0.0;
   kf.change_x(state_point);
@@ -899,6 +907,69 @@ pointcloud_xyz_to_pointtype(const pcl::PointCloud<pcl::PointXYZ> &src,
   dst->is_dense = src.is_dense;
 }
 
+/* PLY from Open3D: x,y,z as FLOAT64. pcl::fromPCLPointCloud2 → PointXYZ often
+ * yields an empty cloud (no matching fields), then the float PLY reader warns
+ * and PointXYZINormal mis-parses the buffer (all-zero xyz). Read x,y,z using
+ * field offsets and datatype instead. */
+static bool cloud2_extract_xyz_float(const pcl::PCLPointCloud2 &cloud,
+                                     pcl::PointCloud<pcl::PointXYZ> &out) {
+  const int ix = pcl::getFieldIndex(cloud, "x");
+  const int iy = pcl::getFieldIndex(cloud, "y");
+  const int iz = pcl::getFieldIndex(cloud, "z");
+  if (ix < 0 || iy < 0 || iz < 0) {
+    return false;
+  }
+  const auto &fx = cloud.fields[static_cast<size_t>(ix)];
+  const auto &fy = cloud.fields[static_cast<size_t>(iy)];
+  const auto &fz = cloud.fields[static_cast<size_t>(iz)];
+
+  auto read_f = [](const uint8_t *pt, const pcl::PCLPointField &f,
+                   float *v) -> bool {
+    if (f.count < 1) {
+      return false;
+    }
+    const uint8_t *p = pt + f.offset;
+    switch (f.datatype) {
+    case pcl::PCLPointField::FLOAT32: {
+      float x;
+      std::memcpy(&x, p, sizeof(float));
+      *v = x;
+      return true;
+    }
+    case pcl::PCLPointField::FLOAT64: {
+      double x;
+      std::memcpy(&x, p, sizeof(double));
+      *v = static_cast<float>(x);
+      return true;
+    }
+    default:
+      return false;
+    }
+  };
+
+  const size_t n =
+      static_cast<size_t>(cloud.width) * static_cast<size_t>(cloud.height);
+  if (n == 0 || cloud.data.empty() || cloud.point_step == 0) {
+    return false;
+  }
+  out.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t *row = &cloud.data[i * cloud.point_step];
+    float xf, yf, zf;
+    if (!read_f(row, fx, &xf) || !read_f(row, fy, &yf) ||
+        !read_f(row, fz, &zf)) {
+      return false;
+    }
+    out.points[i].x = xf;
+    out.points[i].y = yf;
+    out.points[i].z = zf;
+  }
+  out.width = cloud.width;
+  out.height = cloud.height;
+  out.is_dense = false;
+  return true;
+}
+
 bool load_prior_map_from_pcd(const std::string &pcd_path,
                              PointCloudXYZI::Ptr cloud_raw,
                              PointCloudXYZI::Ptr cloud_ds) {
@@ -911,19 +982,39 @@ bool load_prior_map_from_pcd(const std::string &pcd_path,
   bool loaded = false;
 
   /*
-   * Mesh-style PLY (e.g. VCGLIB: x,y,z + nx,ny,nz + rgba, no intensity) must
-   * not be read as PointXYZINormal — property order/names do not match and xyz
-   * end up corrupted (RViz: no cloud).
+   * Open3D (and others) often write binary PLY with property double x,y,z.
+   * loadPLYFile<PointXYZ> expects float fields → "Failed to find match for field
+   * 'x'". fromPCLPointCloud2 → PointXYZ often stays empty on FLOAT64 layouts.
+   * cloud2_extract_xyz_float reads x,y,z by field offset/type. Do not use
+   * PointXYZINormal for Open3D xyz+nx+ny+nz+rgb — layout mismatch → zero xyz.
    */
   if (ext == "ply") {
-    pcl::PointCloud<pcl::PointXYZ> ply_xyz;
-    if (pcl::io::loadPLYFile(full_path, ply_xyz) >= 0 && !ply_xyz.empty()) {
-      pointcloud_xyz_to_pointtype(ply_xyz, cloud_raw);
-      loaded = true;
+    pcl::PCLPointCloud2 blob;
+    if (pcl::io::loadPLYFile(full_path, blob) >= 0 &&
+        blob.width * blob.height > 0 && !blob.data.empty()) {
+      pcl::PointCloud<pcl::PointXYZ> ply_xyz;
+      if (cloud2_extract_xyz_float(blob, ply_xyz) && !ply_xyz.empty()) {
+        pointcloud_xyz_to_pointtype(ply_xyz, cloud_raw);
+        loaded = true;
+      } else {
+        pcl::fromPCLPointCloud2(blob, ply_xyz);
+        if (!ply_xyz.empty()) {
+          pointcloud_xyz_to_pointtype(ply_xyz, cloud_raw);
+          loaded = true;
+        }
+      }
     }
     if (!loaded) {
-      LOG_WARN("[FAST_LIO_Relocation] PLY load as xyz failed or empty; trying "
-               "PointXYZINormal.");
+      pcl::PointCloud<pcl::PointXYZ> ply_xyz_f;
+      if (pcl::io::loadPLYFile(full_path, ply_xyz_f) >= 0 &&
+          !ply_xyz_f.empty()) {
+        pointcloud_xyz_to_pointtype(ply_xyz_f, cloud_raw);
+        loaded = true;
+      }
+    }
+    if (!loaded) {
+      LOG_WARN("[FAST_LIO_Relocation] PLY load via PCLPointCloud2 / PointXYZ "
+               "failed; trying PointXYZINormal (often wrong for Open3D PLY).");
       if (pcl::io::loadPLYFile<PointType>(full_path, *cloud_raw) < 0) {
         LOG_ERROR_STREAM(
             "[FAST_LIO_Relocation] Failed to load map: " << full_path);
@@ -966,11 +1057,10 @@ bool load_prior_map_from_pcd(const std::string &pcd_path,
       min_z = std::min(min_z, p.z);
       max_z = std::max(max_z, p.z);
     }
-    LOG_INFO_STREAM("[FAST_LIO_Relocation] Prior map AABB (raw) x["
-                    << min_x << ", " << max_x << "] y[" << min_y << ", "
-                    << max_y << "] z[" << min_z << ", " << max_z << "]");
+    LOG_INFO("[FAST_LIO_Relocation] Prior map AABB (raw) x[%.3f, %.3f] y[%.3f, "
+             "%.3f] z[%.3f, %.3f] (n=%zu)",
+             min_x, max_x, min_y, max_y, min_z, max_z, cloud_raw->size());
   }
-
   pcl::VoxelGrid<PointType> prior_filter;
   prior_filter.setLeafSize(map_voxel_size, map_voxel_size, map_voxel_size);
   prior_filter.setInputCloud(cloud_raw);
@@ -981,9 +1071,9 @@ bool load_prior_map_from_pcd(const std::string &pcd_path,
     return false;
   }
 
-  LOG_INFO_STREAM("[FAST_LIO_Relocation] Prior map loaded. Raw size = "
+  std::cout<<"[FAST_LIO_Relocation] Prior map loaded. Raw size = "
                   << cloud_raw->size()
-                  << ", downsampled size = " << cloud_ds->size());
+                  << ", downsampled size = " << cloud_ds->size()<<std::endl;
 
   return true;
 }
@@ -995,7 +1085,7 @@ bool init_localization_map_from_prior() {
     LOG_WARN("[FAST_LIO_Relocation] Prior map already initialized.");
     return true;
   }
-
+  std::cout<<"map_file_path: "<<map_file_path<<std::endl;
   if (!load_prior_map_from_pcd(map_file_path, prior_map_raw, prior_map_ds)) {
     return false;
   }
@@ -1765,22 +1855,28 @@ int main(int argc, char **argv) {
       return -1;
     }
 
-    /* Register frame map_frame_id in tf2 and align stamps before first /Laser_map
-     * (RViz needs map->body). */
+    /* Pose for first TF; actual publish happens after add_node (below). */
     state_point = kf.get_x();
     refresh_pose_cache_from_state();
-    publish_odometry(pubOdomAftMapped);
-
-    publish_prior_map(pubLaserCloudMap);
-    prior_map_published_once = true;
-    LOG_INFO("[FAST_LIO_Relocation] Prior map published as latched topic "
-             "/Laser_map.");
   }
   /* ================= FAST_LIO_Relocation modification ================= */
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
   rclcpp::executors::SingleThreadedExecutor exec;
   exec.add_node(g_node);
+  /* Publish /Odometry + TF + latched /Laser_map only after the node is on an
+   * executor and spin_some has run; otherwise RViz often shows "No tf data"
+   * and misses the map (especially with transient_local). */
+  if (is_localization_mode()) {
+    for (int i = 0; i < 20; ++i) {
+      exec.spin_some();
+    }
+    publish_odometry(pubOdomAftMapped);
+    publish_prior_map(pubLaserCloudMap);
+    prior_map_published_once = true;
+    LOG_INFO("[FAST_LIO_Relocation] Prior map published as latched topic "
+             "/Laser_map.");
+  }
   rclcpp::WallRate rate(5000.0);
   bool status = rclcpp::ok();
   (void)sub_imu;
