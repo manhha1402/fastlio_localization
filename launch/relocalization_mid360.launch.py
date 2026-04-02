@@ -38,13 +38,13 @@ def _launch_setup(context, *args, **kwargs):
             arguments=["-d", rviz_config_path],
             condition=IfCondition(LaunchConfiguration("rviz")),
         ),
-        Node(
-        package='vm_navigation_launch',
-        executable='transform_lookup_and_broadcast',
-        name='transform_lookup_and_broadcast',
-        output='screen',
-        parameters=[ParameterFile(transform_lookup_broadcast_config, allow_substs=True)],
-    ),
+        # Node(
+        # package='vm_navigation_launch',
+        # executable='transform_lookup_and_broadcast',
+        # name='transform_lookup_and_broadcast',
+        # output='screen',
+        # parameters=[ParameterFile(transform_lookup_broadcast_config, allow_substs=True)],
+        #),
     ]
 def generate_launch_description():
     pkg_share = get_package_share_directory("fastlio_localization")

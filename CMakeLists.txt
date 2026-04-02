@@ -62,12 +62,13 @@ add_executable(fastlio_mapping
 target_include_directories(fastlio_mapping PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${PCL_INCLUDE_DIRS}
+
 )
 
 if(TARGET Eigen3::Eigen)
-  target_link_libraries(fastlio_mapping Eigen3::Eigen)
+  target_link_libraries(fastlio_mapping Eigen3::Eigen )
 else()
-  target_include_directories(fastlio_mapping PRIVATE ${EIGEN3_INCLUDE_DIR})
+  target_include_directories(fastlio_mapping PRIVATE ${EIGEN3_INCLUDE_DIR} )
 endif()
 
 if(OpenMP_CXX_FOUND)
