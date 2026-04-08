@@ -21,7 +21,6 @@ def _launch_setup(context, *args, **kwargs):
     map_file_path_str = LaunchConfiguration("map_file_path").perform(context).strip()
     if map_file_path_str:
         node_params.append({"map_file_path": map_file_path_str})
-    transform_lookup_broadcast_config = os.path.join(get_package_share_directory('vm_navigation_launch'), 'config', 'transform_lookup_and_broadcast.yaml')
 
     return [
         Node(
@@ -38,13 +37,6 @@ def _launch_setup(context, *args, **kwargs):
             arguments=["-d", rviz_config_path],
             condition=IfCondition(LaunchConfiguration("rviz")),
         ),
-        # Node(
-        # package='vm_navigation_launch',
-        # executable='transform_lookup_and_broadcast',
-        # name='transform_lookup_and_broadcast',
-        # output='screen',
-        # parameters=[ParameterFile(transform_lookup_broadcast_config, allow_substs=True)],
-        #),
     ]
 def generate_launch_description():
     pkg_share = get_package_share_directory("fastlio_localization")
