@@ -116,6 +116,7 @@ int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0,
     kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false,
      extrinsic_est_en = true, path_en = true;
+bool debug_pre_post_pub_en = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -1273,6 +1274,31 @@ void publish_frame_body(
   publish_count -= PUBFRAME_PERIOD;
 }
 
+void publish_pose_with_state(
+    const state_ikfom &state,
+    const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr
+        &publisher) {
+  if (!publisher) {
+    return;
+  }
+
+  geometry_msgs::msg::PoseStamped msg;
+  msg.header.frame_id =
+      is_localization_mode() ? map_frame_id : camera_init_frame_id;
+  set_publish_stamp(msg.header.stamp);
+
+  msg.pose.position.x = state.pos(0);
+  msg.pose.position.y = state.pos(1);
+  msg.pose.position.z = state.pos(2);
+
+  msg.pose.orientation.x = state.rot.coeffs()[0];
+  msg.pose.orientation.y = state.rot.coeffs()[1];
+  msg.pose.orientation.z = state.rot.coeffs()[2];
+  msg.pose.orientation.w = state.rot.coeffs()[3];
+
+  publisher->publish(msg);
+}
+
 void publish_effect_world(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
         &pubLaserCloudEffect) {
@@ -1668,6 +1694,8 @@ int main(int argc, char **argv) {
       node->declare_parameter<bool>("feature_extract_enable", false);
   runtime_pos_log =
       node->declare_parameter<bool>("runtime_pos_log_enable", false);
+  debug_pre_post_pub_en =
+    node->declare_parameter<bool>("publish.debug_pre_post_en", true);
   extrinsic_est_en =
       node->declare_parameter<bool>("mapping.extrinsic_est_en", true);
   pcd_save_en = node->declare_parameter<bool>("pcd_save.pcd_save_en", false);
@@ -1835,6 +1863,10 @@ int main(int argc, char **argv) {
                                                             qos_pub);
   auto pubLaserCloudMap = node->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/Laser_map", qos_map);
+  auto pubPosePreUpdate = node->create_publisher<geometry_msgs::msg::PoseStamped>(
+      "/pose_imu_update", qos_pub);
+  auto pubPosePostUpdate = node->create_publisher<geometry_msgs::msg::PoseStamped>(
+      "/pose_imu_and_lidar_update", qos_pub);
   auto pubOdomAftMapped =
       node->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_pub);
   auto pubPath = node->create_publisher<nav_msgs::msg::Path>("/path", qos_pub);
@@ -2016,6 +2048,9 @@ int main(int argc, char **argv) {
       /* Save pre-update state for post-update gating */
       state_ikfom state_before_update = kf.get_x();
       auto P_before_update = kf.get_P();
+      if (debug_pre_post_pub_en) {
+        publish_pose_with_state(state_before_update, pubPosePreUpdate);
+      }
       kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 
       state_ikfom state_after_update = kf.get_x();
@@ -2034,6 +2069,9 @@ int main(int argc, char **argv) {
       }
 
       refresh_pose_cache_from_state();
+      if (debug_pre_post_pub_en) {
+        publish_pose_with_state(state_point, pubPosePostUpdate);
+      }
       /* Localization: advance tracking state machine */
       if (is_localization_mode()) {
         update_tracking_state_machine();
