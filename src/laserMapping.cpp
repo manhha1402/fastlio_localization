@@ -117,6 +117,7 @@ int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0,
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false,
      extrinsic_est_en = true, path_en = true;
 bool debug_pre_post_pub_en = true;
+bool ignore_data_flg = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -1925,7 +1926,26 @@ int main(int argc, char **argv) {
         first_lidar_time = Measures.lidar_beg_time;
         p_imu->first_lidar_time = first_lidar_time;
         flg_first_scan = false;
-        continue;
+      }
+
+      if (ignore_data_flg){
+          const double lidar_elapsed = Measures.lidar_beg_time - first_lidar_time;
+        double imu_elapsed = lidar_elapsed;
+        if (!Measures.imu.empty()) {
+          imu_elapsed = fastlio_ros2::stamp_to_sec(Measures.imu.front()->header.stamp) -
+                        first_lidar_time;
+        }
+
+        if (lidar_elapsed < 3.0 || imu_elapsed < 3.0) {
+          RCLCPP_INFO(
+            g_node->get_logger(),
+            "Waiting for initial data... lidar=%.2fs imu=%.2fs", lidar_elapsed,
+            imu_elapsed);
+          continue;
+        } else {
+          RCLCPP_INFO(g_node->get_logger(), "Initial data received. Starting...");
+          ignore_data_flg = false;
+        }
       }
 
       double t0, t1, t3, t5;
