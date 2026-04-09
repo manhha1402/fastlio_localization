@@ -133,7 +133,7 @@ double kRawAccClampXY = 0.0;
 
 inline void update_imu_accel_unit_params() {
   kRawAccSaturationThreshold =
-      kImuAccelInputIsG ? 4.0 : 4.0 * kGravityMps2;
+      kImuAccelInputIsG ? 2.5 : 2.5 * kGravityMps2;
   kRawAccClampZ = kImuAccelInputIsG ? 1.0 : kGravityMps2;
   kRawAccClampXY = 0.0;
 }
@@ -507,15 +507,24 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in) {
   auto &lin_acc = msg->linear_acceleration;
 
   if (std::abs(lin_acc.z) > kRawAccSaturationThreshold) {
+    RCLCPP_INFO(rclcpp::get_logger("IMU_Processing"),
+             "Raw IMU accel z saturated: %.3f, clamping to %.3f",
+             lin_acc.z, std::copysign(kRawAccClampZ, lin_acc.z));
     lin_acc.z = std::copysign(kRawAccClampZ, lin_acc.z);
   }
 
   if (std::abs(lin_acc.x) > kRawAccSaturationThreshold) {
-    lin_acc.x = kRawAccClampXY;
+    RCLCPP_INFO(rclcpp::get_logger("IMU_Processing"),
+             "Raw IMU accel x saturated: %.3f, clamping to %.3f",
+             lin_acc.x, std::copysign(kRawAccClampXY, lin_acc.x));
+    lin_acc.x = std::copysign(kRawAccClampXY, lin_acc.x);
   }
 
   if (std::abs(lin_acc.y) > kRawAccSaturationThreshold) {
-    lin_acc.y = kRawAccClampXY;
+    RCLCPP_INFO(rclcpp::get_logger("IMU_Processing"),
+             "Raw IMU accel y saturated: %.3f, clamping to %.3f",
+             lin_acc.y, std::copysign(kRawAccClampXY, lin_acc.y));
+    lin_acc.y = std::copysign(kRawAccClampXY, lin_acc.y);
   }
 
   const double timestamp = fastlio_ros2::stamp_to_sec(msg->header.stamp);
