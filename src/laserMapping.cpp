@@ -75,6 +75,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <cmath>
 
 #include <iomanip>
 #include <iostream>
@@ -117,11 +118,26 @@ int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0,
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false,
      extrinsic_est_en = true, path_en = true;
 bool debug_pre_post_pub_en = true;
+bool ignore_data_flg = true;
 /**************************/
 
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
+constexpr double kGravityMps2 = 9.80665;
+bool kImuAccelInputIsG = true;
+double kRawAccSaturationThreshold = 4.0;
+double kRawAccClampZ = 1.0;
+double kRawAccClampXY = 0.0;
+
+
+inline void update_imu_accel_unit_params() {
+  kRawAccSaturationThreshold =
+      kImuAccelInputIsG ? 4.0 : 4.0 * kGravityMps2;
+  kRawAccClampZ = kImuAccelInputIsG ? 1.0 : kGravityMps2;
+  kRawAccClampXY = 0.0;
+}
+
 double time_diff_lidar_to_imu = 0.0;
 
 std::mutex mtx_buffer;
@@ -485,6 +501,21 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in) {
   if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) {
     fastlio_ros2::set_stamp_from_sec(msg->header.stamp,
                                      timediff_lidar_wrt_imu + t_in);
+  }
+
+  // Raw IMU data is in g units. Suppress saturated spikes before buffering.
+  auto &lin_acc = msg->linear_acceleration;
+
+  if (std::abs(lin_acc.z) > kRawAccSaturationThreshold) {
+    lin_acc.z = std::copysign(kRawAccClampZ, lin_acc.z);
+  }
+
+  if (std::abs(lin_acc.x) > kRawAccSaturationThreshold) {
+    lin_acc.x = kRawAccClampXY;
+  }
+
+  if (std::abs(lin_acc.y) > kRawAccSaturationThreshold) {
+    lin_acc.y = kRawAccClampXY;
   }
 
   const double timestamp = fastlio_ros2::stamp_to_sec(msg->header.stamp);
@@ -1665,6 +1696,9 @@ int main(int argc, char **argv) {
   imu_topic =
       node->declare_parameter<std::string>("common.imu_topic", "/livox/imu");
   time_sync_en = node->declare_parameter<bool>("common.time_sync_en", false);
+    kImuAccelInputIsG =
+      node->declare_parameter<bool>("common.imu_accel_input_is_g", true);
+    update_imu_accel_unit_params();
   time_diff_lidar_to_imu =
       node->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
   filter_size_corner_min =
@@ -1925,7 +1959,26 @@ int main(int argc, char **argv) {
         first_lidar_time = Measures.lidar_beg_time;
         p_imu->first_lidar_time = first_lidar_time;
         flg_first_scan = false;
-        continue;
+      }
+
+      if (ignore_data_flg){
+          const double lidar_elapsed = Measures.lidar_beg_time - first_lidar_time;
+        double imu_elapsed = lidar_elapsed;
+        if (!Measures.imu.empty()) {
+          imu_elapsed = fastlio_ros2::stamp_to_sec(Measures.imu.front()->header.stamp) -
+                        first_lidar_time;
+        }
+
+        if (lidar_elapsed < 3.0 || imu_elapsed < 3.0) {
+          RCLCPP_INFO(
+            g_node->get_logger(),
+            "Waiting for initial data... lidar=%.2fs imu=%.2fs", lidar_elapsed,
+            imu_elapsed);
+          continue;
+        } else {
+          RCLCPP_INFO(g_node->get_logger(), "Initial data received. Starting...");
+          ignore_data_flg = false;
+        }
       }
 
       double t0, t1, t3, t5;
