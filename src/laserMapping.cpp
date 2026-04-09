@@ -75,6 +75,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <cmath>
 
 #include <iomanip>
 #include <iostream>
@@ -123,6 +124,20 @@ bool ignore_data_flg = true;
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
+constexpr double kGravityMps2 = 9.80665;
+bool kImuAccelInputIsG = true;
+double kRawAccSaturationThreshold = 4.0;
+double kRawAccClampZ = 1.0;
+double kRawAccClampXY = 0.0;
+
+
+inline void update_imu_accel_unit_params() {
+  kRawAccSaturationThreshold =
+      kImuAccelInputIsG ? 4.0 : 4.0 * kGravityMps2;
+  kRawAccClampZ = kImuAccelInputIsG ? 1.0 : kGravityMps2;
+  kRawAccClampXY = 0.0;
+}
+
 double time_diff_lidar_to_imu = 0.0;
 
 std::mutex mtx_buffer;
@@ -486,6 +501,21 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in) {
   if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) {
     fastlio_ros2::set_stamp_from_sec(msg->header.stamp,
                                      timediff_lidar_wrt_imu + t_in);
+  }
+
+  // Raw IMU data is in g units. Suppress saturated spikes before buffering.
+  auto &lin_acc = msg->linear_acceleration;
+
+  if (std::abs(lin_acc.z) > kRawAccSaturationThreshold) {
+    lin_acc.z = std::copysign(kRawAccClampZ, lin_acc.z);
+  }
+
+  if (std::abs(lin_acc.x) > kRawAccSaturationThreshold) {
+    lin_acc.x = kRawAccClampXY;
+  }
+
+  if (std::abs(lin_acc.y) > kRawAccSaturationThreshold) {
+    lin_acc.y = kRawAccClampXY;
   }
 
   const double timestamp = fastlio_ros2::stamp_to_sec(msg->header.stamp);
@@ -1666,6 +1696,9 @@ int main(int argc, char **argv) {
   imu_topic =
       node->declare_parameter<std::string>("common.imu_topic", "/livox/imu");
   time_sync_en = node->declare_parameter<bool>("common.time_sync_en", false);
+    kImuAccelInputIsG =
+      node->declare_parameter<bool>("common.imu_accel_input_is_g", true);
+    update_imu_accel_unit_params();
   time_diff_lidar_to_imu =
       node->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
   filter_size_corner_min =
