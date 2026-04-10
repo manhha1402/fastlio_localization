@@ -507,9 +507,9 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in) {
   auto &lin_acc = msg->linear_acceleration;
 
   if (std::abs(lin_acc.z) > kRawAccSaturationThreshold) {
-    RCLCPP_INFO(rclcpp::get_logger("IMU_Processing"),
-             "Raw IMU accel z saturated: %.3f, clamping to %.3f",
-             lin_acc.z, std::copysign(kRawAccClampZ, lin_acc.z));
+    // RCLCPP_INFO(rclcpp::get_logger("IMU_Processing"),
+    //          "Raw IMU accel z saturated: %.3f, clamping to %.3f",
+    //          lin_acc.z, std::copysign(kRawAccClampZ, lin_acc.z));
     lin_acc.z = std::copysign(kRawAccClampZ, lin_acc.z);
   }
 
