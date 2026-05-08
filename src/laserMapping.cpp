@@ -126,7 +126,7 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 constexpr double kGravityMps2 = 9.80665;
 bool kImuAccelInputIsG = true;
-double kRawAccSaturationThreshold = 4.0;
+double kRawAccSaturationThreshold = 2.5;
 double kRawAccClampZ = 1.0;
 double kRawAccClampXY = 0.0;
 
