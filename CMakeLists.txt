@@ -51,7 +51,12 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(vm_navigation_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/LocalizationStatus.msg"
+  DEPENDENCIES std_msgs
+)
 
 
 add_executable(fastlio_mapping
@@ -87,8 +92,11 @@ ament_target_dependencies(fastlio_mapping
   std_msgs
   tf2
   tf2_ros
-  vm_navigation_msgs
 )
+
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME} rosidl_typesupport_cpp)
+target_link_libraries(fastlio_mapping "${cpp_typesupport_target}")
 
 ament_target_dependencies(fastlio_mapping livox_ros_driver2)
 
@@ -99,4 +107,5 @@ target_link_libraries(fastlio_mapping
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME})
 
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()

@@ -81,11 +81,11 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
-#include <vm_navigation_msgs/msg/localization_status.hpp>
+#include <fastlio_localization/msg/localization_status.hpp>
 
 static rclcpp::Node::SharedPtr g_node;
 static std::shared_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
-static rclcpp::Publisher<vm_navigation_msgs::msg::LocalizationStatus>::SharedPtr
+static rclcpp::Publisher<fastlio_localization::msg::LocalizationStatus>::SharedPtr
     g_pub_localization_status;
 
 #define LOG_ERROR(...) RCLCPP_ERROR(g_node->get_logger(), __VA_ARGS__)
@@ -869,13 +869,13 @@ void update_tracking_state_machine() {
   }
 }
 
-/** Publish vm_navigation_msgs/LocalizationStatus from FAST-LIO tracking state.
+/** Publish fastlio_localization/LocalizationStatus from FAST-LIO tracking state.
  *  TRACKING_LOCKED → GOOD, TRACKING_TRACKING → DEGRADED, else → LOST. */
 static void publish_localization_status() {
   if (!g_pub_localization_status || !g_node) {
     return;
   }
-  vm_navigation_msgs::msg::LocalizationStatus msg;
+  fastlio_localization::msg::LocalizationStatus msg;
   msg.header.stamp = g_node->now();
   msg.header.frame_id = map_frame_id;
   if (tracking_state == TRACKING_LOCKED) {
@@ -1915,7 +1915,7 @@ int main(int argc, char **argv) {
   auto pubPath = node->create_publisher<nav_msgs::msg::Path>("/path", qos_pub);
   if (is_localization_mode()) {
     g_pub_localization_status =
-        node->create_publisher<vm_navigation_msgs::msg::LocalizationStatus>(
+        node->create_publisher<fastlio_localization::msg::LocalizationStatus>(
             "/localization_status", rclcpp::QoS(10).reliable());
   }
   // pubLocalizationOverlayText = nh.advertise<jsk_rviz_plugins::OverlayText>
