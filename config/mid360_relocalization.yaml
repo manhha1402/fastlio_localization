@@ -1,20 +1,23 @@
 /**:
   ros__parameters:
     run_mode: 1
-    map_file_path: "3dmap_vmo_36.ply"
+    # Filename only. The node loads share/fastlio_localization/map/<this>.
+    # Prior cloud of MuJoCo scene 11_three_storey_house_F1.
+    map_file_path: "11_three_storey_house_F1.ply"
     map_voxel_size: 0.2
 
     common:
-        imu_accel_input_is_g: true
-        lid_topic: "/livox/lidar"
-        imu_topic: "/livox/imu"
+        # vd_mujoco publishes specific force in m/s^2 on the Livox IMU topic.
+        imu_accel_input_is_g: false
+        lid_topic: "/sensors/lidar/livox/pointcloud"
+        imu_topic: "/sensors/lidar/livox/imu"
         time_sync_en: false
         time_offset_lidar_to_imu: 0.0
 
     preprocess:
         # lidar_type: 1=LIVOX, 2=VELO16, 3=OUST64, 4=MARSIM, 5=SIM (xyz PointCloud2)
-        # Optional launch override: ros2 launch ... lidar_type:=5
-        lidar_type: 1
+        # MuJoCo --use_lidar publishes sensor_msgs/PointCloud2, so SIM (5).
+        lidar_type: 5
         # If true, PointCloud2 sub uses best_effort (use when publisher is not reliable)
         lidar_qos_sensor_data: false
         scan_line: 4
@@ -22,6 +25,9 @@
 
     mapping:
         gravity_align_en: true
+        # Keeps the filter frame that already matches the prior map.
+        # /Odometry X is this frame yawed by publish.heading_yaw.
+        gravity_align_forward: [0.0, -1.0, 0.0]
         acc_cov: 0.1
         gyr_cov: 0.1
         b_acc_cov: 0.0001
@@ -29,7 +35,8 @@
         fov_degree: 360.0
         det_range: 100.0
         extrinsic_est_en: false
-        extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+        # Sim publishes both cloud and IMU as livox_frame (sites a few mm apart).
+        extrinsic_T: [ 0.0, 0.0, 0.0 ]
         extrinsic_R: [ 1.0, 0.0, 0.0,
                        0.0, 1.0, 0.0,
                        0.0, 0.0, 1.0 ]
@@ -52,6 +59,7 @@
         scan_publish_en: true
         dense_publish_en: true
         scan_bodyframe_pub_en: true
+        heading_yaw: 0.13
 
     pcd_save:
         pcd_save_en: false

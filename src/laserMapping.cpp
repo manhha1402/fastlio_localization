@@ -282,6 +282,14 @@ vect3 pos_lid;
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
+/* Applied only to /Odometry and 3dmap->body. The filter rotation is left
+   alone, so the registered scan stays on the prior map. */
+double heading_yaw = 0.0;
+
+static Eigen::Quaterniond heading_offset_q() {
+  return Eigen::Quaterniond(
+      Eigen::AngleAxisd(heading_yaw, Eigen::Vector3d::UnitZ()));
+}
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
@@ -709,6 +717,10 @@ static void try_apply_pending_initial_pose() {
     return;
   }
   q.normalize();
+  /* The arrow is the published body pose. Store the filter rotation with
+     the heading yaw removed so the next publish draws that same arrow. */
+  const Eigen::Quaterniond q_state =
+      (q * heading_offset_q().conjugate()).normalized();
 
   state_point = kf.get_x();
   const double z_prev = state_point.pos(2);
@@ -721,7 +733,8 @@ static void try_apply_pending_initial_pose() {
   //   state_point.pos(2) = z_prev;
   // }
   state_point.pos(2) = 0;
-  state_point.rot = SO3(q.w(), q.x(), q.y(), q.z());
+  state_point.rot =
+      SO3(q_state.w(), q_state.x(), q_state.y(), q_state.z());
   state_point.vel << 0.0, 0.0, 0.0;
   kf.change_x(state_point);
 
@@ -1492,10 +1505,14 @@ void refresh_pose_cache_from_state() {
   euler_cur = SO3ToEuler(state_point.rot);
   pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-  geoQuat.x = state_point.rot.coeffs()[0];
-  geoQuat.y = state_point.rot.coeffs()[1];
-  geoQuat.z = state_point.rot.coeffs()[2];
-  geoQuat.w = state_point.rot.coeffs()[3];
+  Eigen::Quaterniond q_pub(
+      state_point.rot.coeffs()[3], state_point.rot.coeffs()[0],
+      state_point.rot.coeffs()[1], state_point.rot.coeffs()[2]);
+  q_pub = (q_pub * heading_offset_q()).normalized();
+  geoQuat.x = q_pub.x();
+  geoQuat.y = q_pub.y();
+  geoQuat.z = q_pub.z();
+  geoQuat.w = q_pub.w();
 }
 
 template <typename T> void set_posestamp(T &out) {
@@ -1698,6 +1715,8 @@ int main(int argc, char **argv) {
       node->declare_parameter<bool>("publish.dense_publish_en", true);
   scan_body_pub_en =
       node->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+  heading_yaw =
+      node->declare_parameter<double>("publish.heading_yaw", 0.0);
   NUM_MAX_ITERATIONS = node->declare_parameter<int>("max_iteration", 4);
   map_file_path = node->declare_parameter<std::string>("map_file_path", "");
   lid_topic =
@@ -1801,6 +1820,13 @@ int main(int argc, char **argv) {
   /* ================= FAST_LIO_Relocation modification ================= */
 
   p_imu->set_gravity_align_enable(gravity_align_en);
+  const std::vector<double> align_fwd =
+      node->declare_parameter<std::vector<double>>(
+          "mapping.gravity_align_forward", std::vector<double>{});
+  if (align_fwd.size() == 3) {
+    p_imu->set_gravity_align_forward(
+        V3D(align_fwd[0], align_fwd[1], align_fwd[2]));
+  }
   p_pre->lidar_type = lidar_type;
   std::cout << "p_pre->lidar_type " << p_pre->lidar_type << std::endl;
 
@@ -1881,8 +1907,13 @@ int main(int argc, char **argv) {
     sub_pcl_std = node->create_subscription<sensor_msgs::msg::PointCloud2>(
         lid_topic, qos_pc, standard_pcl_cbk);
   }
+  /* vd_mujoco publishes the Livox IMU with SensorDataQoS (best effort). */
+  rclcpp::QoS qos_imu_sub = qos_imu;
+  if (lidar_type == SIM) {
+    qos_imu_sub.best_effort();
+  }
   auto sub_imu = node->create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic, qos_imu, imu_cbk);
+      imu_topic, qos_imu_sub, imu_cbk);
 
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
       sub_initial_pose;

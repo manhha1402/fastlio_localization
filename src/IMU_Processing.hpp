@@ -57,6 +57,17 @@ public:
   /// Optional: enable/disable gravity alignment from YAML
   void set_gravity_align_enable(bool en) { gravity_align_en_ = en; }
 
+  /// Unit vector, in the LiDAR frame, that should become +X of the level frame.
+  /// A zero vector leaves the gravity-alignment yaw unchanged.
+  void set_gravity_align_forward(const V3D &fwd) {
+    if (fwd.norm() > 1e-6) {
+      gravity_align_forward_ = fwd.normalized();
+      has_forward_ = true;
+    } else {
+      has_forward_ = false;
+    }
+  }
+
   Eigen::Matrix<double, 12, 12> Q;
 
   void Process(const MeasureGroup &meas,
@@ -112,6 +123,10 @@ private:
 
   // True once alignment quaternion has been computed
   bool has_align_ = false;
+
+  // LiDAR-frame axis to yaw-align onto level +X (zero = unused)
+  V3D gravity_align_forward_ = V3D::Zero();
+  bool has_forward_ = false;
 };
 
 ImuProcess::ImuProcess()
@@ -257,6 +272,21 @@ void ImuProcess::IMU_init(
       q_align_ =
           Eigen::Quaterniond::FromTwoVectors(acc0, Eigen::Vector3d::UnitZ());
       has_align_ = true;
+
+      // FromTwoVectors fixes roll and pitch only. An upside-down mount
+      // (180 deg about X) is completed as 180 deg about Y, which yaws the
+      // level frame 180 deg away from the robot. Swing the configured
+      // forward axis onto level +X so the published heading matches.
+      if (has_forward_) {
+        const Eigen::Vector3d fwd_l = q_align_ * gravity_align_forward_;
+        const double horiz = std::hypot(fwd_l.x(), fwd_l.y());
+        if (horiz > 1e-3) {
+          const double yaw = std::atan2(fwd_l.y(), fwd_l.x());
+          q_align_ = Eigen::Quaterniond(Eigen::AngleAxisd(
+                         yaw, Eigen::Vector3d::UnitZ())) *
+                     q_align_;
+        }
+      }
 
       // Rotate mean_gyr into virtual level frame
       Eigen::Vector3d gyr0(mean_gyr.x(), mean_gyr.y(), mean_gyr.z());
