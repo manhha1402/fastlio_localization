@@ -25,9 +25,10 @@
 
     mapping:
         gravity_align_en: true
-        # Keeps the filter frame that already matches the prior map.
-        # /Odometry X is this frame yawed by publish.heading_yaw.
-        gravity_align_forward: [0.0, -1.0, 0.0]
+        # Robot forward axis expressed in livox_frame. The Livox is mounted
+        # 180 deg about X, so robot +X is still livox +X. The level filter
+        # frame's +X is this axis, so publish.heading_yaw stays 0.
+        gravity_align_forward: [1.0, 0.0, 0.0]
         acc_cov: 0.1
         gyr_cov: 0.1
         b_acc_cov: 0.0001
@@ -59,7 +60,7 @@
         scan_publish_en: true
         dense_publish_en: true
         scan_bodyframe_pub_en: true
-        heading_yaw: 0.13
+        heading_yaw: 0.0
 
     pcd_save:
         pcd_save_en: false

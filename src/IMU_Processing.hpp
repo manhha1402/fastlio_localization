@@ -273,17 +273,18 @@ void ImuProcess::IMU_init(
           Eigen::Quaterniond::FromTwoVectors(acc0, Eigen::Vector3d::UnitZ());
       has_align_ = true;
 
-      // FromTwoVectors fixes roll and pitch only. An upside-down mount
-      // (180 deg about X) is completed as 180 deg about Y, which yaws the
-      // level frame 180 deg away from the robot. Swing the configured
-      // forward axis onto level +X so the published heading matches.
+      // FromTwoVectors fixes roll and pitch only. For an upside-down mount
+      // acc0 is nearly antiparallel to +Z, so the 180 deg axis (and thus the
+      // level frame's yaw) is picked arbitrarily and changes with tiny tilts.
+      // Rotate by -yaw so the configured forward axis lands on level +X,
+      // making the frame deterministic.
       if (has_forward_) {
         const Eigen::Vector3d fwd_l = q_align_ * gravity_align_forward_;
         const double horiz = std::hypot(fwd_l.x(), fwd_l.y());
         if (horiz > 1e-3) {
           const double yaw = std::atan2(fwd_l.y(), fwd_l.x());
           q_align_ = Eigen::Quaterniond(Eigen::AngleAxisd(
-                         yaw, Eigen::Vector3d::UnitZ())) *
+                         -yaw, Eigen::Vector3d::UnitZ())) *
                      q_align_;
         }
       }
